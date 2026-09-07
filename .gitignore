@@ -1,0 +1,63 @@
+# ==========================================
+# Checkpoints & Model Weights
+# ==========================================
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+checkpoint*
+ckpt_*
+checkpoints/
+**/checkpoints/
+
+# ==========================================
+# Training Data & Cache
+# ==========================================
+data.txt
+*.log
+runs/
+wandb/
+
+# ==========================================
+# Python & Bytecode
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==========================================
+# Virtual Environments
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+
+# ==========================================
+# IDE & System Files
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
