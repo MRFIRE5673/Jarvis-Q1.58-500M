@@ -1,0 +1,148 @@
+{
+  "training_spec": {
+    "model_family": "Jarvis-Q1.58-vNext",
+    "architecture_spec": {
+      "d_model": 1024,
+      "n_layers": 24,
+      "n_heads": 16,
+      "d_head": 64,
+      "moe_experts": 4,
+      "moe_top_k": 2,
+      "vocab_size": 50257,
+      "max_seq_len": 2048,
+      "ternary_linear": "AbsMean Quantization with STE (1.58-bit)",
+      "memory_mechanism": "W16 Gated Recurrent Associative Memory",
+      "total_parameters": 607177560,
+      "active_parameters_per_token": 353600000
+    },
+    "precision_and_memory": {
+      "autocast_precision": "bfloat16",
+      "master_weights": "float32",
+      "gradient_checkpointing": true,
+      "activation_memory_gb": 1.4,
+      "model_and_grad_memory_gb": 3.6,
+      "optimizer_memory_gb": 1.1,
+      "estimated_peak_training_vram_gb": 6.1,
+      "hardware_target": "NVIDIA GeForce RTX 5070 12GB GDDR7",
+      "vram_headroom_gb": 5.9
+    },
+    "optimization": {
+      "optimizer": "AdamW (decoupled weight decay)",
+      "beta1": 0.9,
+      "beta2": 0.95,
+      "eps": 1e-08,
+      "weight_decay": 0.1,
+      "weight_decay_exclusions": [
+        "bias",
+        "LayerNorm.weight",
+        "gamma",
+        "alpha"
+      ],
+      "gradient_clipping_max_norm": 1.0,
+      "peak_learning_rate": 0.00015,
+      "min_learning_rate": 1.5e-05,
+      "warmup_tokens": 8192000,
+      "lr_decay_schedule": "CosineAnnealingLR down to 10% peak",
+      "aux_router_balance_loss_coef": 0.01
+    },
+    "batching_and_tokens": {
+      "sequence_length": 512,
+      "micro_batch_size": 2,
+      "gradient_accumulation_steps": 4,
+      "tokens_per_optimizer_step": 4096,
+      "total_target_tokens": 1000000000,
+      "total_optimizer_steps": 244140
+    },
+    "checkpointing_and_resumption": {
+      "checkpoint_interval_steps": 2500,
+      "save_directory": "experiments/checkpoints_1b/",
+      "saved_components": [
+        "model_state_dict",
+        "optimizer_state_dict",
+        "scheduler_state_dict",
+        "dataloader_state (shard_idx, offset, epoch)",
+        "global_step",
+        "loss_trajectory",
+        "rng_states"
+      ],
+      "rolling_keep_best_k": 3,
+      "keep_latest_checkpoints": 2,
+      "atomic_write": true
+    },
+    "validation_cadence": {
+      "eval_interval_steps": 1250,
+      "eval_num_sequences": 64,
+      "eval_metrics": [
+        "holdout_ce",
+        "holdout_ppl",
+        "router_entropy",
+        "load_imbalance_cv"
+      ]
+    }
+  },
+  "throughput_benchmarks": {
+    "hardware": "NVIDIA GeForce RTX 5070 (12GB GDDR7)",
+    "raw_train_tokens_per_sec": 2350.0,
+    "effective_tokens_per_sec": 2009.2,
+    "eval_overhead_fraction": 0.03,
+    "checkpoint_overhead_fraction": 0.02,
+    "assumed_uptime_duty_cycle": 0.9
+  },
+  "milestone_estimates": [
+    {
+      "target_tokens": 100000000,
+      "target_tokens_str": "100M",
+      "optimizer_steps": 24414,
+      "checkpoints_saved": 9,
+      "ideal_hours": 11.82,
+      "realistic_hours": 13.82,
+      "realistic_days": 0.58,
+      "raw_throughput_tok_s": 2350.0,
+      "effective_throughput_tok_s": 2009.2
+    },
+    {
+      "target_tokens": 250000000,
+      "target_tokens_str": "250M",
+      "optimizer_steps": 61035,
+      "checkpoints_saved": 24,
+      "ideal_hours": 29.55,
+      "realistic_hours": 34.56,
+      "realistic_days": 1.44,
+      "raw_throughput_tok_s": 2350.0,
+      "effective_throughput_tok_s": 2009.2
+    },
+    {
+      "target_tokens": 500000000,
+      "target_tokens_str": "500M",
+      "optimizer_steps": 122070,
+      "checkpoints_saved": 48,
+      "ideal_hours": 59.1,
+      "realistic_hours": 69.12,
+      "realistic_days": 2.88,
+      "raw_throughput_tok_s": 2350.0,
+      "effective_throughput_tok_s": 2009.2
+    },
+    {
+      "target_tokens": 800000000,
+      "target_tokens_str": "800M",
+      "optimizer_steps": 195312,
+      "checkpoints_saved": 78,
+      "ideal_hours": 94.56,
+      "realistic_hours": 110.6,
+      "realistic_days": 4.61,
+      "raw_throughput_tok_s": 2350.0,
+      "effective_throughput_tok_s": 2009.2
+    },
+    {
+      "target_tokens": 1000000000,
+      "target_tokens_str": "1.0B",
+      "optimizer_steps": 244140,
+      "checkpoints_saved": 97,
+      "ideal_hours": 118.2,
+      "realistic_hours": 138.25,
+      "realistic_days": 5.76,
+      "raw_throughput_tok_s": 2350.0,
+      "effective_throughput_tok_s": 2009.2
+    }
+  ]
+}

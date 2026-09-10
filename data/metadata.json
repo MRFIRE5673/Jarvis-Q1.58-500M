@@ -1,0 +1,27 @@
+{
+  "dataset_name": "FineWeb-Edu Sample-10BT (Curated Jarvis Billion-Token Pre-Training Corpus)",
+  "sources": [
+    "https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu/resolve/main/sample/10BT/000_00000.parquet",
+    "https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu/resolve/main/sample/10BT/001_00000.parquet"
+  ],
+  "license": "Open Data Commons Attribution (ODC-By 1.0) / CC-BY-4.0",
+  "created_at": "2026-09-10T21:21:04Z",
+  "tokenizer": "tiktoken / gpt2",
+  "vocab_size": 50257,
+  "token_datatype": "uint16",
+  "target_train_tokens": 1000000000,
+  "total_usable_tokens": 1001588263,
+  "train_tokens": 1000000000,
+  "val_tokens": 1588263,
+  "val_percentage": 0.159,
+  "train_shards_count": 20,
+  "val_shards_count": 1,
+  "tokens_per_shard": 50000000,
+  "shard_bytes": 100000000,
+  "document_length_stats": {
+    "mean_tokens": 1020.5,
+    "median_tokens": 631.0,
+    "p95_tokens": 2909.0
+  },
+  "dataset_ready_for_training": true
+}
