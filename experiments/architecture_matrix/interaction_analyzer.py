@@ -9,10 +9,10 @@ Computes empirical interaction coefficients across memory mechanism pairs:
   Actual(A+B) = CE(A+B) - CE(baseline)
   Interaction(A, B) = Actual(A+B) - Expected(A+B)
 
-Synergy Classification:
-- Interaction < -0.01: SYNERGISTIC (Cooperative)
-- |Interaction| <= 0.01: ADDITIVE (Independent)
-- Interaction > +0.01: ANTAGONISTIC (Interfering / Redundant)
+Interaction Classification:
+- Interaction < -0.01: NEGATIVE INTERACTION (Sub-additive / Empirical Complementarity)
+- |Interaction| <= 0.01: ADDITIVE (Linear Independence)
+- Interaction > +0.01: POSITIVE INTERACTION (Super-additive / Mutually Disruptive)
 """
 
 import os
@@ -89,11 +89,11 @@ def analyze_interactions():
             interaction = actual_delta - expected_delta
 
             if interaction < -0.01:
-                verdict = "SYNERGISTIC"
+                verdict = "NEGATIVE INTERACTION (Sub-additive)"
             elif interaction > 0.01:
-                verdict = "ANTAGONISTIC"
+                verdict = "POSITIVE INTERACTION (Super-additive)"
             else:
-                verdict = "ADDITIVE"
+                verdict = "ADDITIVE (Linear)"
 
             results.append({
                 "pair": pair_code,
