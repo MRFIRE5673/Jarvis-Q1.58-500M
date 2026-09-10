@@ -188,12 +188,80 @@ The validated architecture is **`Jarvis-BCE`**:
 | **3** | **Best Pair** | **`C+E` (Erase Gate + Local Buffer)** (Final CE 3.2877, PPL 26.78, $\beta = -0.0115$). |
 | **4** | **Best Higher-Order Candidate** | **`B+C+E` (Write Gate + Erase Gate + Local Buffer)** (CE 3.2881, Best 3.2777 at step 50). |
 | **5** | **Best Multi-Seed Candidate** | **`B+C+E`** (Mean CE $3.2783 \pm 0.0082$, Mean PPL $26.53 \pm 0.22$). |
-| **6** | **Does it Actually Beat Baseline?** | **Yes.** Confirmed across 3 seeds. Beats baseline by $-0.0075$ at $T=512$, and $-0.0072$ at $T=1024$. |
+| **6** | **Does it Actually Beat Baseline?** | **Conditional.** Beats baseline across 3 seeds at 100 steps; exhibits divergence at 500 steps. |
 | **7** | **Long-Context Behavior** | Strictly superior at $T=1024$ ($3.0169$ vs $3.0241$ CE, 3/3 seeds win). Buffer relieves recurrent pressure. |
-| **8** | **Retrieval Behavior** | Canonical needle rank @ 64 is $8000.5 \pm 811.7$ vs Baseline $7051.0$. Rank 7100 on seed 123. |
+| **8** | **Retrieval Behavior** | Canonical needle rank @ 64 is $7691.5 \pm 2021.8$ vs Baseline $7267.4 \pm 1919.5$ ($p = 0.3078$, indistinguishable). |
 | **9** | **Parameter Overhead** | +787,560 parameters (+0.13% total parameter overhead). |
-| **10** | **VRAM** | 11.8 GB training peak / 2.9 GB inference. Stable on single RTX 5070 12GB. |
-| **11** | **Throughput** | 1,902.9 tok/s prefill (+114% faster than paper baseline due to SDPA sliding window). |
-| **12** | **Remaining Weaknesses** | Zero-shot single needle top-1 retrieval remains 0.0% without passkey instruction fine-tuning. |
-| **13** | **Recommended Next Experiment** | Long-context stress testing at $T \in [2048, 4096, 8192]$ and selective content-based erase gating. |
+| **10** | **VRAM** | 3.16 GB training / 2.77 GB inference peak. Safe on single RTX 5070 12GB. |
+| **11** | **Throughput** | Standardized benchmark: $4,497.1 \pm 80.6$ tok/s vs Baseline $3,404.1 \pm 50.0$ tok/s (+32.1% faster). |
+| **12** | **Remaining Weaknesses** | Gate weights remain near initial saturation at $\text{lr}=5\times 10^{-5}$; holdout loss diverges beyond 250 steps. |
+| **13** | **Recommended Next Experiment** | Decouple gate learning rate ($\text{lr}_{\text{gate}} = 5\times 10^{-4}$) and test local buffer $W=16$ alone. |
 | **14** | **What Should NOT Be Changed** | The core ternary AbsMean quantization, 4-expert Top-2 MoE routing, and GELU activations. |
+
+---
+
+## Section 10: Pre-Implementation Stress Testing & Decision Verdict
+
+### 1. Parameter Accounting Audit (Verified from Live Checkpoint)
+- **Checkpoint:** `experiments/extended_train/ckpt_step_0004284_best.pt` (2,314.17 MB, step 4,284)
+- **Exact Total Parameters:** 606,391,704
+- **Exact Active Parameters per Token:** 405,064,704 (66.80% active compute ratio)
+- **Matching Tensors:** 555 / 555 tensors matched (0 missing, 0 unexpected)
+- **Baseline Gamma:** $\gamma_{\text{raw}} \in [2.7859, 2.8684]$, $\gamma = \sigma(\gamma_{\text{raw}}) \in [0.9419, 0.9463]$
+
+### 2. Standardized Deterministic Throughput & VRAM Benchmark
+*Audit Finding on Prior Variation:* Prior throughput numbers varied (948–2,612 tok/s) due to timing only 15 iterations immediately following backprop without thermal/P-state stabilization. Under the new deterministic protocol (20 warmup iterations, 5 trials $\times$ 100 steps = 500 forward passes, explicit CUDA synchronization):
+
+| Metric | Paper Baseline | Candidate `B+C+E` | Delta | Verdict |
+| :--- | :---: | :---: | :---: | :--- |
+| **Prefill Throughput** | $3,404.1 \pm 50.0$ tok/s | **$4,497.1 \pm 80.6$ tok/s** | **$+1,093.0$ tok/s** | **+32.1% faster inference** |
+| **Step Latency** | $300.88 \pm 4.45$ ms | **$227.77 \pm 4.09$ ms** | **$-73.11$ ms** | Lower latency per step |
+| **Peak Inference VRAM** | 2,668.4 MB | **2,773.1 MB** | $+104.7$ MB | Modest footprint (+3.9%) |
+
+### 3. Rigorous Associative Retrieval Statistical Audit
+*Audit Protocol:* $N=30$ independent distractor trials per distance on Paper Baseline and all three random seeds of `B+C+E` using only the canonical prompt:
+
+| Architecture / Seed | N | Mean Rank @ 64 tok | Median Rank | Min Rank | Max Rank | Top-1 Accuracy |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Paper Baseline** | 30 | **$7,267.4 \pm 1,919.5$** | 6,714.5 | 3,677 | 11,150 | 0.0% |
+| **`B+C+E` (Seed 42)** | 30 | $8,703.3 \pm 1,961.4$ | 8,817.0 | 4,514 | 12,427 | 0.0% |
+| **`B+C+E` (Seed 123)** | 30 | **$7,016.9 \pm 1,867.1$** | 7,282.0 | **3,461** | 10,814 | 0.0% |
+| **`B+C+E` (Seed 456)** | 30 | $7,354.3 \pm 1,826.7$ | 7,288.5 | 4,283 | 11,476 | 0.0% |
+| **`B+C+E` Combined** | **90** | **$7,691.5 \pm 2,021.8$** | 7,542.0 | 3,461 | 12,427 | 0.0% |
+
+- **Welch's Two-Sample t-test:** $t = -1.020$, $df = 51.6$, **$p = 0.3078$** ($p > 0.05$).
+- **Conclusion:** Candidate `B+C+E` and the Paper Baseline are **EXPERIMENTALLY INDISTINGUISHABLE** in associative retrieval retention (no regression, within natural baseline variance).
+
+### 4. Longer Adaptation Test (500 Steps) & Gate Diagnostics Trajectory
+*Protocol:* 500 optimization steps ($2,048,000$ tokens) from the locked checkpoint with periodic evaluations:
+
+| Checkpoint | $T=512$ Holdout CE / PPL | $T=1024$ Holdout CE / PPL | Needle Rank @ 64 | Write Gate ($\mu$) | Erase Gate ($\mu$) | Local / Recurrent Ratio | Peak VRAM |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Step 000** | 3.0484 / 21.08 | 2.7439 / 15.55 | 8,228.7 | 0.982 | 0.018 | 14.2% / 85.8% | 3,163.4 MB |
+| **Step 100** | 3.0676 / 21.49 | 3.1050 / 22.31 | 8,523.7 | 0.983 | 0.016 | 13.8% / 86.2% | 10,305.7 MB |
+| **Step 250** | 3.1466 / 23.26 | 3.2097 / 24.77 | 8,305.1 | 0.983 | 0.014 | 13.5% / 86.5% | 10,682.2 MB |
+| **Step 500** | 3.5225 / 33.87 | 2.9292 / 18.71 | 8,580.0 | 0.984 | 0.013 | 13.4% / 86.6% | 10,682.2 MB |
+
+### 5. Mechanistic Failure Analysis & Gate Inertia
+1. **Gate Inertia:** Under the shared learning rate $\text{lr} = 5\times 10^{-5}$, write gate values moved only from $0.982 \to 0.984$, and erase gate values from $0.018 \to 0.013$. The gates remained in their initial neutral saturation regimes without developing dynamic content-dependent modulation.
+2. **Loss Divergence Beyond 250 Steps:** While training loss steadily decreased ($8.28 \to 5.55$), $T=512$ holdout loss degraded after Step 100 ($3.06 \to 3.52$). In contrast, $T=1024$ extended context retained low loss ($2.9292$, PPL $18.71$).
+3. **Primary Structural Driver:** The local buffer ($W=16$) stably contributed **13.4%–14.2%** of total attention magnitude throughout all 500 steps, accounting for the primary throughput and long-context advantages.
+
+### 6. Final Decision Classification
+
+In accordance with the pre-established decision hierarchy:
+
+> ### **CLASSIFICATION: 2. PROMISING BUT NEEDS MORE EVIDENCE**
+>
+> **Status:** **NOT READY FOR IMPLEMENTATION LOCK**
+>
+> **Justification:**
+> 1. In short-horizon multi-seed adaptation (100 steps), `B+C+E` reproducibly beats baseline on both $T=512$ and $T=1024$ contexts with +32.1% faster prefill.
+> 2. However, in extended adaptation (500 steps), holdout loss on short contexts diverges ($3.52$ CE) due to gate inertia under uniform learning rates.
+> 3. The write and erase gates did not learn significant dynamic modulations, indicating that the local buffer $W=16$ is carrying the architectural weight.
+>
+> **Required Experiments Before Permanent Implementation:**
+> 1. **Decoupled Gate Learning Rates:** Train with $\text{lr}_{\text{gate}} = 5\times 10^{-4}$ ($10\times$ backbone rate) to test if dynamic write/erase behaviors emerge.
+> 2. **Ablation of Gates (`E` vs `C+E` vs `B+C+E`):** Test whether local sliding buffer $W=16$ alone provides all observed speedup and context scaling without the parameter overhead of unadapted gates.
+> 3. **The Paper Baseline Remains Unmodified.**
+

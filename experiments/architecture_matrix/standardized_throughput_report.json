@@ -1,0 +1,22 @@
+{
+  "baseline": {
+    "name": "Paper Baseline",
+    "mean_throughput_tok_s": 3404.0557099162734,
+    "std_throughput_tok_s": 49.988562190430955,
+    "min_throughput_tok_s": 3322.7987093738507,
+    "max_throughput_tok_s": 3463.3770420196565,
+    "mean_step_time_ms": 300.8787537998869,
+    "std_step_time_ms": 4.452643429237943,
+    "peak_vram_mb": 2668.357421875
+  },
+  "candidate_bce": {
+    "name": "Candidate B+C+E",
+    "mean_throughput_tok_s": 4497.112292155195,
+    "std_throughput_tok_s": 80.63660488325418,
+    "min_throughput_tok_s": 4380.624675024718,
+    "max_throughput_tok_s": 4600.089015317023,
+    "mean_step_time_ms": 227.77052799999365,
+    "std_step_time_ms": 4.086997488372855,
+    "peak_vram_mb": 2773.07666015625
+  }
+}
