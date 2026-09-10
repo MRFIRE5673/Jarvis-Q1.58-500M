@@ -3,12 +3,14 @@
 | Experiment ID | Category | Initial CE | Final CE | $\Delta$ CE | Final PPL | Throughput | Needle Rank @ 64 |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | `baseline` | Frozen Baseline | 3.2858 | **3.2858** | +0.0000 | 26.73 | 890 tok/s | 4053.0 |
+| `fact_C+E` | Factorial (C+E) | 3.2849 | **3.2877** | +0.0028 | 26.78 | 1125 tok/s | 9058.8 |
 | `fact_B+C` | Factorial (B+C) | 3.2853 | **3.2882** | +0.0029 | 26.79 | 1213 tok/s | 9085.4 |
 | `exp_adaptive_decay` | Adaptive Decay | 3.3412 | **3.2887** | -0.0525 | 26.81 | 5132 tok/s | 10382.2 |
 | `fact_C+D` | Factorial (C+D) | 3.2853 | **3.2889** | +0.0036 | 26.81 | 1954 tok/s | 8907.2 |
 | `fact_C` | Factorial (C) | 3.2858 | **3.2889** | +0.0032 | 26.81 | 5117 tok/s | 8963.6 |
 | `fact_A+C` | Factorial (A+C) | 3.2888 | **3.2895** | +0.0007 | 26.83 | 4903 tok/s | 9200.8 |
 | `fact_B+E` | Factorial (B+E) | 3.2836 | **3.2943** | +0.0107 | 26.96 | 2246 tok/s | 9104.8 |
+| `fact_D+E` | Factorial (D+E) | 3.2838 | **3.2949** | +0.0111 | 26.97 | 2658 tok/s | 9228.8 |
 | `fact_E` | Factorial (E) | 3.2960 | **3.2960** | +0.0000 | 27.00 | 3804 tok/s | 9184.4 |
 | `fact_B` | Factorial (B) | 3.2847 | **3.2960** | +0.0113 | 27.00 | 4957 tok/s | 8986.2 |
 | `fact_B+D` | Factorial (B+D) | 3.2843 | **3.2965** | +0.0123 | 27.02 | 2791 tok/s | 9129.6 |
