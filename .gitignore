@@ -6,6 +6,7 @@
 *.bin
 *.ckpt
 *.safetensors
+*.jarvis-tbin
 checkpoint*
 ckpt_*
 checkpoints/
@@ -17,6 +18,7 @@ checkpoints/
 data.txt
 data_clean.txt
 fresh_holdout.txt
+*.parquet
 *.txt.gz
 *.jsonl
 *.log
