@@ -2,6 +2,7 @@
 
 | Experiment ID | Category | Initial CE | Final CE | $\Delta$ CE | Final PPL | Throughput | Needle Rank @ 64 |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `fact_B+C+E_s123` | Factorial (B+C+E, seed=123) | 3.2192 | **3.2789** | +0.0597 | 26.55 | 2612 tok/s | 7100.0 |
 | `baseline` | Frozen Baseline | 3.2858 | **3.2858** | +0.0000 | 26.73 | 890 tok/s | 4053.0 |
 | `fact_C+E` | Factorial (C+E) | 3.2849 | **3.2877** | +0.0028 | 26.78 | 1125 tok/s | 9058.8 |
 | `fact_B+C+E` | Factorial (B+C+E) | 3.2850 | **3.2881** | +0.0031 | 26.79 | 948 tok/s | 9067.2 |
