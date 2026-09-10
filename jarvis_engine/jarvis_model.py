@@ -11,7 +11,7 @@ Bugs fixed vs. original:
      with alpha computed dynamically from expert output variance (Algo 1 L15).
   6. LiquidStateFusion: membrane state now persists across the full sequence.
 """
-import math, torch, torch.nn as nn, torch.nn.functional as F
+import os, sys, glob, math, torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_ckpt
 from utils.ternary_ops import TernaryLinear
 
@@ -139,11 +139,11 @@ class AssociativeLinearAttention(nn.Module):
         ip1   = self._i_idx_p1     # (cs,)    float32
         cm1mi = self._c_m1_m_i     # (cs,)    float32
 
-        # Per-chunk decay quantities — computed ONCE, reused for all 4 chunks
-        decay_mat   = torch.exp(log_g.view(H,1,1) * dc) * ca   # (H,cs,cs) float32
-        gamma_cross = torch.exp(log_g.view(H,1) * ip1)          # (H,cs)
-        gw          = torch.exp(log_g.view(H,1) * cm1mi)        # (H,cs)
-        gamma_c     = torch.exp(log_g * cs).view(1,H,1,1)       # (1,H,1,1)
+        # Per-chunk decay quantities — computed ONCE, reused for all chunks
+        decay_mat   = (torch.exp(log_g.view(H,1,1) * dc) * ca).to(dtype=x.dtype)   # (H,cs,cs)
+        gamma_cross = torch.exp(log_g.view(H,1) * ip1).to(dtype=x.dtype)          # (H,cs)
+        gw          = torch.exp(log_g.view(H,1) * cm1mi).to(dtype=x.dtype)        # (H,cs)
+        gamma_c     = torch.exp(log_g * cs).view(1,H,1,1).to(dtype=x.dtype)       # (1,H,1,1)
 
         state = torch.zeros(B, H, D, D, device=x.device, dtype=x.dtype)
         outputs = []
@@ -166,10 +166,10 @@ class AssociativeLinearAttention(nn.Module):
                 i_c      = self._i_idx[:c]                                    # (c,)
                 diff_c   = (i_c.unsqueeze(1) - i_c.unsqueeze(0)).clamp(min=0)  # (c,c)
                 causal_c = (i_c.unsqueeze(1) - i_c.unsqueeze(0) >= 0).float()  # (c,c)
-                dm       = torch.exp(log_g.view(H,1,1) * diff_c) * causal_c   # (H,c,c)
-                gc_cross = torch.exp(log_g.view(H,1) * (i_c + 1))             # (H,c)
-                gw_c     = torch.exp(log_g.view(H,1) * (c - 1 - i_c))         # (H,c)
-                gc_state = torch.exp(log_g * c).view(1,H,1,1)
+                dm       = (torch.exp(log_g.view(H,1,1) * diff_c) * causal_c).to(dtype=x.dtype)   # (H,c,c)
+                gc_cross = torch.exp(log_g.view(H,1) * (i_c + 1)).to(dtype=x.dtype)             # (H,c)
+                gw_c     = torch.exp(log_g.view(H,1) * (c - 1 - i_c)).to(dtype=x.dtype)         # (H,c)
+                gc_state = torch.exp(log_g * c).view(1,H,1,1).to(dtype=x.dtype)
 
             # Intra-chunk decayed linear attention
             raw       = torch.einsum('bhid,bhjd->bhij', q_c, k_c)        # (B,H,c,c)
@@ -351,13 +351,65 @@ class ReflectivePenalty(nn.Module):
         return l_reflect
 
 
+# ---------------------------------------------------------------------------
+# Native CUDA Acceleration with Automatic Pure-PyTorch Fallback
+# ---------------------------------------------------------------------------
+_WORKSPACE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+for _ext_dir in [
+    os.path.join(_WORKSPACE_ROOT, "associative_attention_cuda"),
+    os.path.join(_WORKSPACE_ROOT, "sparse_model_cuda"),
+]:
+    if os.path.isdir(_ext_dir) and _ext_dir not in sys.path:
+        sys.path.insert(0, _ext_dir)
+
+# On Windows (Python 3.8+), native extensions require CUDA bin in DLL directory
+if os.name == 'nt' and hasattr(os, 'add_dll_directory'):
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if not cuda_home:
+        cuda_candidates = sorted(
+            glob.glob(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*"),
+            reverse=True
+        )
+        if cuda_candidates:
+            cuda_home = cuda_candidates[0]
+    if cuda_home:
+        cuda_bin = os.path.join(cuda_home, "bin")
+        if os.path.exists(cuda_bin):
+            try:
+                os.add_dll_directory(cuda_bin)
+            except Exception:
+                pass
+
+_HAS_CUDA_ATTN = False
+_HAS_CUDA_MOE = False
+
+try:
+    from associative_attention import CUDAAssociativeLinearAttention
+    _HAS_CUDA_ATTN = True
+except Exception:
+    CUDAAssociativeLinearAttention = None
+
+try:
+    from sparse_model import CUDASparseMoELayer
+    _HAS_CUDA_MOE = True
+except Exception:
+    CUDASparseMoELayer = None
+
+
 class JarvisBlock(nn.Module):
-    def __init__(self, d_model, n_heads, num_experts=4, top_k=2, max_seq_len=2048):
+    def __init__(self, d_model, n_heads, num_experts=4, top_k=2, max_seq_len=2048,
+                 use_cuda_attn: bool = True, use_cuda_moe: bool = True):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
-        self.attn = AssociativeLinearAttention(d_model, n_heads, max_seq_len=max_seq_len)
+        if use_cuda_attn and _HAS_CUDA_ATTN:
+            self.attn = CUDAAssociativeLinearAttention(d_model, n_heads, max_seq_len=max_seq_len)
+        else:
+            self.attn = AssociativeLinearAttention(d_model, n_heads, max_seq_len=max_seq_len)
         self.norm2 = RMSNorm(d_model)
-        self.moe = SparseMoELayer(d_model, num_experts=num_experts, top_k=top_k)
+        if use_cuda_moe and _HAS_CUDA_MOE:
+            self.moe = CUDASparseMoELayer(d_model, num_experts=num_experts, top_k=top_k)
+        else:
+            self.moe = SparseMoELayer(d_model, num_experts=num_experts, top_k=top_k)
         self.liquid = LiquidStateFusion(d_model)
         self.reflect = ReflectivePenalty()
 
@@ -391,13 +443,19 @@ class JarvisBlock(nn.Module):
 
 class Jarvis(nn.Module):
     def __init__(self, vocab_size=50257, d_model=1024, n_layers=24, n_heads=16,
-                 num_experts=4, top_k=2, max_seq_len=1024):
+                 num_experts=4, top_k=2, max_seq_len=1024,
+                 use_cuda_attn: bool = True, use_cuda_moe: bool = True):
         super().__init__()
         self.d_model = d_model
+        self.use_cuda_attn = use_cuda_attn and _HAS_CUDA_ATTN
+        self.use_cuda_moe = use_cuda_moe and _HAS_CUDA_MOE
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         # Note: pos_emb removed — replaced by RoPE in AssociativeLinearAttention
         self.blocks = nn.ModuleList([
-            JarvisBlock(d_model, n_heads, num_experts, top_k, max_seq_len=max_seq_len) for _ in range(n_layers)
+            JarvisBlock(
+                d_model, n_heads, num_experts, top_k, max_seq_len=max_seq_len,
+                use_cuda_attn=use_cuda_attn, use_cuda_moe=use_cuda_moe
+            ) for _ in range(n_layers)
         ])
         self.final_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
@@ -407,6 +465,20 @@ class Jarvis(nn.Module):
         # shape per entry: (B, C) — the last-token membrane of each block.
         self._h_states: list = [None] * n_layers
         self._token_pos: int = 0
+
+    def get_backend_status(self):
+        """Returns the active backend status for attention and MoE across all blocks."""
+        attn_cuda_count = sum(1 for b in self.blocks if CUDAAssociativeLinearAttention and isinstance(b.attn, CUDAAssociativeLinearAttention))
+        moe_cuda_count = sum(1 for b in self.blocks if CUDASparseMoELayer and isinstance(b.moe, CUDASparseMoELayer))
+        total_blocks = len(self.blocks)
+        return {
+            "has_cuda_attn_extension": _HAS_CUDA_ATTN,
+            "has_cuda_moe_extension": _HAS_CUDA_MOE,
+            "attn_backend": "cuda" if attn_cuda_count == total_blocks else ("pytorch" if attn_cuda_count == 0 else "mixed"),
+            "moe_backend": "cuda" if moe_cuda_count == total_blocks else ("pytorch" if moe_cuda_count == 0 else "mixed"),
+            "attn_cuda_blocks": f"{attn_cuda_count}/{total_blocks}",
+            "moe_cuda_blocks": f"{moe_cuda_count}/{total_blocks}",
+        }
 
     def reset_state(self):
         """Clear persisted liquid membrane states and position (call between unrelated sequences)."""

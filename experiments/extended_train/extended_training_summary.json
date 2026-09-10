@@ -1,0 +1,67 @@
+{
+  "start_step": 4209,
+  "end_step": 4309,
+  "total_new_steps": 100,
+  "tokens_trained": 409600,
+  "train_corpus": "data_clean.txt",
+  "learning_rate": 5e-05,
+  "initial_holdout_ce": 3.29539781332016,
+  "initial_holdout_ppl": 26.988148179504623,
+  "best_holdout_ce": 3.287973066568375,
+  "best_holdout_ppl": 26.78851006232097,
+  "final_holdout_ce": 3.288771835565567,
+  "final_holdout_ppl": 26.809916441877725,
+  "ce_improvement": 0.007424746751785172,
+  "ppl_improvement": 0.1996381171836532,
+  "best_checkpoint": "E:\\Jarvis-Q1.58-500M\\experiments\\extended_train\\ckpt_step_0004284_best.pt",
+  "trajectory": [
+    {
+      "step": 4234,
+      "relative_step": 25,
+      "train_ce": 1.626123994588852,
+      "train_total_loss": 1.8680656254291534,
+      "holdout_ce": 3.291810488700867,
+      "holdout_ppl": 26.891506377508364,
+      "holdout_bal_loss": 0.24505560278892516,
+      "holdout_ref_loss": 0.0026867584873753003,
+      "grad_norm": 0.7311174869537354,
+      "lr": 5e-05
+    },
+    {
+      "step": 4259,
+      "relative_step": 50,
+      "train_ce": 2.0380812287330627,
+      "train_total_loss": 2.2797300815582275,
+      "holdout_ce": 3.290039381980896,
+      "holdout_ppl": 26.843920801858367,
+      "holdout_bal_loss": 0.2450024175643921,
+      "holdout_ref_loss": 0.0022771631020805216,
+      "grad_norm": 0.9126291275024414,
+      "lr": 4e-05
+    },
+    {
+      "step": 4284,
+      "relative_step": 75,
+      "train_ce": 1.5804827511310577,
+      "train_total_loss": 1.8221432566642761,
+      "holdout_ce": 3.287973066568375,
+      "holdout_ppl": 26.78851006232097,
+      "holdout_bal_loss": 0.24486542493104935,
+      "holdout_ref_loss": 0.0022253558256227278,
+      "grad_norm": 0.7324697375297546,
+      "lr": 2.000000000000001e-05
+    },
+    {
+      "step": 4309,
+      "relative_step": 100,
+      "train_ce": 1.7189799547195435,
+      "train_total_loss": 1.9604218900203705,
+      "holdout_ce": 3.288771835565567,
+      "holdout_ppl": 26.809916441877725,
+      "holdout_bal_loss": 0.244869726896286,
+      "holdout_ref_loss": 0.002564132033179476,
+      "grad_norm": 0.7866242527961731,
+      "lr": 1e-05
+    }
+  ]
+}

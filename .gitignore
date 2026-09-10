@@ -15,9 +15,17 @@ checkpoints/
 # Training Data & Cache
 # ==========================================
 data.txt
+data_clean.txt
+fresh_holdout.txt
+*.txt.gz
+*.jsonl
 *.log
 runs/
 wandb/
+scratch/
+.env*
+credentials*
+secrets*
 
 # ==========================================
 # Python & Bytecode
