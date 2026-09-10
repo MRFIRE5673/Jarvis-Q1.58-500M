@@ -148,6 +148,7 @@ def collect_model_diagnostics(model, val_tokens, device="cuda"):
         "mean_read_gate": statistics.mean(r_gates) if r_gates else 1.0,
         "local_to_recurrent_norm_ratio": statistics.mean(local_norms) / max(statistics.mean(rec_norms), 1e-6) if local_norms else 0.0,
         "mean_fusion_gate": statistics.mean(fusion_ratios) if fusion_ratios else 0.0,
+        "recurrent_state_norm": statistics.mean(rec_norms) if rec_norms else 0.0,
     }
 
 
@@ -160,7 +161,11 @@ def run_factorial_experiment(
     force: bool = False,
 ):
     exp_id, cfg = parse_combo_code(combo_str, fusion_option)
-    category = f"Factorial ({combo_str})"
+    if seed != 42:
+        exp_id += f"_s{seed}"
+        category = f"Factorial ({combo_str}, seed={seed})"
+    else:
+        category = f"Factorial ({combo_str})"
 
     print("\n" + "=" * 90)
     print(f"FACTORIAL EXPERIMENT: {exp_id}")
@@ -240,6 +245,8 @@ def run_factorial_experiment(
     model.train()
     t_start = time.perf_counter()
     val_ce, val_ppl = init_ce, init_ppl
+    best_ce = init_ce
+    best_step = 0
 
     for step in range(start_step, steps + 1):
         optimizer.zero_grad(set_to_none=True)
@@ -257,7 +264,10 @@ def run_factorial_experiment(
             dt = time.perf_counter() - t_start
             tok_s = (step * 8 * 512) / max(dt, 1e-4)
             val_ce, val_ppl = evaluate_holdout(model, val_tokens, num_windows=50, seq_len=512, seed=seed)
-            print(f"  Step {step:03d}/{steps}: Holdout CE = {val_ce:.4f} | PPL = {val_ppl:.2f} | {tok_s:.0f} tok/s", flush=True)
+            if val_ce < best_ce:
+                best_ce = val_ce
+                best_step = step
+            print(f"  Step {step:03d}/{steps}: Holdout CE = {val_ce:.4f} | PPL = {val_ppl:.2f} | {tok_s:.0f} tok/s (Best: {best_ce:.4f} @ step {best_step})", flush=True)
 
             save_sd = {k: v.to(torch.bfloat16) if v.is_floating_point() else v for k, v in model.state_dict().items()}
             inter_save = os.path.join(ARCH_DIR, f"ckpt_{exp_id}_step{step:03d}.pt")
@@ -307,9 +317,12 @@ def run_factorial_experiment(
         "category": category,
         "components": combo_str,
         "fusion_option": fusion_option,
+        "seed": seed,
         "initial_ce": init_ce,
         "final_ce": final_ce,
         "ce_delta": final_ce - init_ce,
+        "best_ce": best_ce,
+        "best_step": best_step,
         "final_ppl": final_ppl,
         "tok_s": prefill_speed,
         "needle_rank_64": needle_rank_64,

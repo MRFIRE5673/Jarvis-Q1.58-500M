@@ -728,6 +728,108 @@
       "checkpoint": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\ckpt_fact_D+E.pt",
       "canonical_report": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\canonical_eval_fact_D+E.json",
       "status": "COMPLETED"
+    },
+    "fact_B+C+E": {
+      "experiment_id": "fact_B+C+E",
+      "category": "Factorial (B+C+E)",
+      "components": "B+C+E",
+      "fusion_option": 2,
+      "initial_ce": 3.284995141029358,
+      "final_ce": 3.2880813026428224,
+      "ce_delta": 0.003086161613464533,
+      "best_ce": 3.2776848316192626,
+      "best_step": 50,
+      "final_ppl": 26.791409702410412,
+      "tok_s": 948.5,
+      "needle_rank_64": 9067.2,
+      "vram": {
+        "allocated_mb": 10665.1,
+        "reserved_mb": 12104.0,
+        "peak_mb": 11828.9,
+        "param_mb": 2316.2,
+        "optimizer_mb": 4632.4,
+        "activation_mb": 3716.5
+      },
+      "diagnostics": {
+        "mean_gamma": 0.9459519609808922,
+        "mean_write_gate": 0.9837239583333334,
+        "mean_erase_gate": 0.0153656005859375,
+        "mean_read_gate": 1.0,
+        "local_to_recurrent_norm_ratio": 0.09764974843513591,
+        "mean_fusion_gate": 0.047408303866783776,
+        "recurrent_state_norm": 0.008298762006840358
+      },
+      "checkpoint": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\ckpt_fact_B+C+E.pt",
+      "canonical_report": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\canonical_eval_fact_B+C+E.json",
+      "status": "COMPLETED"
+    },
+    "fact_A+B+C": {
+      "experiment_id": "fact_A+B+C",
+      "category": "Factorial (A+B+C)",
+      "components": "A+B+C",
+      "fusion_option": 2,
+      "initial_ce": 3.288101468086243,
+      "final_ce": 3.2894692420959473,
+      "ce_delta": 0.0013677740097044477,
+      "best_ce": 3.2802101135253907,
+      "best_step": 50,
+      "final_ppl": 26.828620374047365,
+      "tok_s": 2860.8,
+      "needle_rank_64": 9048.2,
+      "vram": {
+        "allocated_mb": 10675.6,
+        "reserved_mb": 12198.0,
+        "peak_mb": 11840.0,
+        "param_mb": 2317.7,
+        "optimizer_mb": 4635.4,
+        "activation_mb": 3722.5
+      },
+      "diagnostics": {
+        "mean_gamma": 0.95361328125,
+        "mean_write_gate": 0.9832356770833334,
+        "mean_erase_gate": 0.016204833984375,
+        "mean_read_gate": 1.0,
+        "local_to_recurrent_norm_ratio": 0.0,
+        "mean_fusion_gate": 0.0,
+        "recurrent_state_norm": 0.008643299341201782
+      },
+      "checkpoint": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\ckpt_fact_A+B+C.pt",
+      "canonical_report": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\canonical_eval_fact_A+B+C.json",
+      "status": "COMPLETED"
+    },
+    "fact_A+B+C+E": {
+      "experiment_id": "fact_A+B+C+E",
+      "category": "Factorial (A+B+C+E)",
+      "components": "A+B+C+E",
+      "fusion_option": 2,
+      "initial_ce": 3.2874389410018923,
+      "final_ce": 3.288862290382385,
+      "ce_delta": 0.0014233493804929331,
+      "best_ce": 3.2792249798774717,
+      "best_step": 50,
+      "final_ppl": 26.812341637642053,
+      "tok_s": 1441.5,
+      "needle_rank_64": 8959.6,
+      "vram": {
+        "allocated_mb": 10674.5,
+        "reserved_mb": 12032.0,
+        "peak_mb": 11838.2,
+        "param_mb": 2317.7,
+        "optimizer_mb": 4635.4,
+        "activation_mb": 3721.4
+      },
+      "diagnostics": {
+        "mean_gamma": 0.95361328125,
+        "mean_write_gate": 0.9837239583333334,
+        "mean_erase_gate": 0.016171773274739582,
+        "mean_read_gate": 1.0,
+        "local_to_recurrent_norm_ratio": 0.09344175259330288,
+        "mean_fusion_gate": 0.04741185794894894,
+        "recurrent_state_norm": 0.00866644065051029
+      },
+      "checkpoint": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\ckpt_fact_A+B+C+E.pt",
+      "canonical_report": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\canonical_eval_fact_A+B+C+E.json",
+      "status": "COMPLETED"
     }
   },
   "leaderboard": [
@@ -1458,6 +1560,108 @@
       },
       "checkpoint": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\ckpt_fact_D+E.pt",
       "canonical_report": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\canonical_eval_fact_D+E.json",
+      "status": "COMPLETED"
+    },
+    {
+      "experiment_id": "fact_B+C+E",
+      "category": "Factorial (B+C+E)",
+      "components": "B+C+E",
+      "fusion_option": 2,
+      "initial_ce": 3.284995141029358,
+      "final_ce": 3.2880813026428224,
+      "ce_delta": 0.003086161613464533,
+      "best_ce": 3.2776848316192626,
+      "best_step": 50,
+      "final_ppl": 26.791409702410412,
+      "tok_s": 948.5,
+      "needle_rank_64": 9067.2,
+      "vram": {
+        "allocated_mb": 10665.1,
+        "reserved_mb": 12104.0,
+        "peak_mb": 11828.9,
+        "param_mb": 2316.2,
+        "optimizer_mb": 4632.4,
+        "activation_mb": 3716.5
+      },
+      "diagnostics": {
+        "mean_gamma": 0.9459519609808922,
+        "mean_write_gate": 0.9837239583333334,
+        "mean_erase_gate": 0.0153656005859375,
+        "mean_read_gate": 1.0,
+        "local_to_recurrent_norm_ratio": 0.09764974843513591,
+        "mean_fusion_gate": 0.047408303866783776,
+        "recurrent_state_norm": 0.008298762006840358
+      },
+      "checkpoint": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\ckpt_fact_B+C+E.pt",
+      "canonical_report": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\canonical_eval_fact_B+C+E.json",
+      "status": "COMPLETED"
+    },
+    {
+      "experiment_id": "fact_A+B+C",
+      "category": "Factorial (A+B+C)",
+      "components": "A+B+C",
+      "fusion_option": 2,
+      "initial_ce": 3.288101468086243,
+      "final_ce": 3.2894692420959473,
+      "ce_delta": 0.0013677740097044477,
+      "best_ce": 3.2802101135253907,
+      "best_step": 50,
+      "final_ppl": 26.828620374047365,
+      "tok_s": 2860.8,
+      "needle_rank_64": 9048.2,
+      "vram": {
+        "allocated_mb": 10675.6,
+        "reserved_mb": 12198.0,
+        "peak_mb": 11840.0,
+        "param_mb": 2317.7,
+        "optimizer_mb": 4635.4,
+        "activation_mb": 3722.5
+      },
+      "diagnostics": {
+        "mean_gamma": 0.95361328125,
+        "mean_write_gate": 0.9832356770833334,
+        "mean_erase_gate": 0.016204833984375,
+        "mean_read_gate": 1.0,
+        "local_to_recurrent_norm_ratio": 0.0,
+        "mean_fusion_gate": 0.0,
+        "recurrent_state_norm": 0.008643299341201782
+      },
+      "checkpoint": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\ckpt_fact_A+B+C.pt",
+      "canonical_report": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\canonical_eval_fact_A+B+C.json",
+      "status": "COMPLETED"
+    },
+    {
+      "experiment_id": "fact_A+B+C+E",
+      "category": "Factorial (A+B+C+E)",
+      "components": "A+B+C+E",
+      "fusion_option": 2,
+      "initial_ce": 3.2874389410018923,
+      "final_ce": 3.288862290382385,
+      "ce_delta": 0.0014233493804929331,
+      "best_ce": 3.2792249798774717,
+      "best_step": 50,
+      "final_ppl": 26.812341637642053,
+      "tok_s": 1441.5,
+      "needle_rank_64": 8959.6,
+      "vram": {
+        "allocated_mb": 10674.5,
+        "reserved_mb": 12032.0,
+        "peak_mb": 11838.2,
+        "param_mb": 2317.7,
+        "optimizer_mb": 4635.4,
+        "activation_mb": 3721.4
+      },
+      "diagnostics": {
+        "mean_gamma": 0.95361328125,
+        "mean_write_gate": 0.9837239583333334,
+        "mean_erase_gate": 0.016171773274739582,
+        "mean_read_gate": 1.0,
+        "local_to_recurrent_norm_ratio": 0.09344175259330288,
+        "mean_fusion_gate": 0.04741185794894894,
+        "recurrent_state_norm": 0.00866644065051029
+      },
+      "checkpoint": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\ckpt_fact_A+B+C+E.pt",
+      "canonical_report": "E:\\Jarvis-Q1.58-500M\\experiments\\architecture_matrix\\canonical_eval_fact_A+B+C+E.json",
       "status": "COMPLETED"
     }
   ]
