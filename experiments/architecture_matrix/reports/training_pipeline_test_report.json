@@ -1,0 +1,49 @@
+{
+  "vram_safety": {
+    "status": "PASSED",
+    "allocated_mb": 9420.4,
+    "peak_mb": 10115.3,
+    "reserved_mb": 10596.0,
+    "headroom_mb": 1630.6,
+    "safety_margin_pct": 13.3
+  },
+  "throughput": {
+    "status": "PASSED",
+    "avg_step_latency_ms": 5388.6,
+    "raw_tokens_per_sec": 760.1,
+    "effective_tokens_per_sec": 684.1,
+    "projections": {
+      "100M": {
+        "tokens": 100000000,
+        "realistic_hours": 40.6,
+        "realistic_days": 1.69
+      },
+      "250M": {
+        "tokens": 250000000,
+        "realistic_hours": 101.51,
+        "realistic_days": 4.23
+      },
+      "500M": {
+        "tokens": 500000000,
+        "realistic_hours": 203.02,
+        "realistic_days": 8.46
+      },
+      "800M": {
+        "tokens": 800000000,
+        "realistic_hours": 324.84,
+        "realistic_days": 13.53
+      },
+      "1.0B": {
+        "tokens": 1000000000,
+        "realistic_hours": 406.05,
+        "realistic_days": 16.92
+      }
+    }
+  },
+  "checkpoint_resume": {
+    "status": "PASSED",
+    "verified_step": 23,
+    "verified_tokens": 94208,
+    "batch_determinism_match": true
+  }
+}
