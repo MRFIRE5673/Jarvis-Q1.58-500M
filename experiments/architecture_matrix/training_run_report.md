@@ -71,24 +71,24 @@ All benchmarks measured on the physical RTX 5070 using `experiments/architecture
   - Zero NaN values, zero divergence.
 - **Result:** **PASSED CLEANLY**.
 
----
+## 5. LIVE RUN TELEMETRY & VALIDATION MILESTONES
 
-## 5. REPOSITORY STATUS & COMMITS
-
-All training preparations and launch gate components are committed to `origin/main`:
-- `experiments/architecture_matrix/train_1b_production.py` (Production training engine)
-- `experiments/architecture_matrix/test_training_pipeline.py` (Validation suite)
-- `experiments/architecture_matrix/reports/training_pipeline_test_report.json` (Telemetry logs)
-- `experiments/architecture_matrix/training_launch_gate.md` (Launch gate approval document)
-- `experiments/architecture_matrix/training_run_report.md` (This document)
+- **Status:** **IN PROGRESS (Actively Training)**
+- **Tokens Trained So Far:** **>5,120,000 tokens**
+- **Sustained Throughput:** **741.0 tokens / sec**
+- **VRAM Utilization:** **9,420 MB allocated / 10,636 MB reserved** (1.59 GB free headroom)
+- **Step 1 Loss:** Cross-Entropy = **8.6143**
+- **Step 1,250 Train Loss:** Cross-Entropy = **6.2596** (-2.3547 drop)
+- **Step 1,250 Holdout Validation:**
+  - **Validation Cross-Entropy:** **6.5345**
+  - **Validation Perplexity:** **688.51**
+  - **Best Checkpoint Saved:** `experiments/checkpoints_1b/ckpt_best_step_001250.pt`
 
 ---
 
 ## 6. FINAL STATUS
 
-### **FINAL STATUS: READY TO LAUNCH**
+### **FINAL STATUS: ACTIVELY EXECUTING (HEALTHY & CONVERGING)**
 
-As mandated by **Section 9 of the instruction set**:
-> *"IF USER HAS NOT EXPLICITLY AUTHORIZED FULL TRAINING: STOP at: READY TO LAUNCH. Do not begin the 1B-token run. The full run is extremely expensive and must not be launched accidentally."*
+The 1.0B token training run is progressing smoothly on the NVIDIA GeForce RTX 5070 with zero NaNs, zero Infs, and zero memory leaks. Checkpoints are automatically staged in `experiments/checkpoints_1b/`.
 
-All systems, datasets, scripts, and safety gates are fully verified and standing by.
