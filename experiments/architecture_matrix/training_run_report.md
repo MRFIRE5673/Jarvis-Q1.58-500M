@@ -74,15 +74,18 @@ All benchmarks measured on the physical RTX 5070 using `experiments/architecture
 ## 5. LIVE RUN TELEMETRY & VALIDATION MILESTONES
 
 - **Status:** **IN PROGRESS (Actively Training)**
-- **Tokens Trained So Far:** **>5,120,000 tokens**
-- **Sustained Throughput:** **741.0 tokens / sec**
+- **Tokens Trained So Far:** **>9,625,600 tokens** (Step 2,350+ / 244,140)
+- **Sustained Throughput:** **743.0 tokens / sec**
 - **VRAM Utilization:** **9,420 MB allocated / 10,636 MB reserved** (1.59 GB free headroom)
+- **Current Learning Rate:** **1.50e-4** (Linear warmup completed; peak cosine schedule active)
 - **Step 1 Loss:** Cross-Entropy = **8.6143**
-- **Step 1,250 Train Loss:** Cross-Entropy = **6.2596** (-2.3547 drop)
+- **Step 1,250 Train Loss:** Cross-Entropy = **6.2596**
 - **Step 1,250 Holdout Validation:**
   - **Validation Cross-Entropy:** **6.5345**
   - **Validation Perplexity:** **688.51**
   - **Best Checkpoint Saved:** `experiments/checkpoints_1b/ckpt_best_step_001250.pt`
+- **Step 2,350 Train Loss:** Cross-Entropy = **5.9885** (-2.6258 drop from Step 1)
+- **Approaching:** Step 2,500 milestone (Periodic Checkpoint `ckpt_step_002500.pt` + Validation Evaluation #2)
 
 ---
 
