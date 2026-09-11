@@ -20,6 +20,7 @@ import sys
 import math
 import time
 import json
+import glob
 import argparse
 import torch
 import torch.nn.functional as F
@@ -310,4 +311,43 @@ def train(
 
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(description="Jarvis 1.0B Production Training Engine")
+    parser.add_argument("--max-tokens", type=int, default=1_000_000_000, help="Target training tokens")
+    parser.add_argument("--seq-len", type=int, default=512, help="Sequence length")
+    parser.add_argument("--micro-batch", type=int, default=2, help="Micro batch size")
+    parser.add_argument("--accum-steps", type=int, default=4, help="Gradient accumulation steps")
+    parser.add_argument("--max-lr", type=float, default=1.5e-4, help="Peak learning rate")
+    parser.add_argument("--min-lr", type=float, default=1.5e-5, help="Minimum learning rate floor")
+    parser.add_argument("--warmup-steps", type=int, default=2000, help="Linear warmup steps")
+    parser.add_argument("--save-every", type=int, default=2500, help="Checkpoint frequency (steps)")
+    parser.add_argument("--eval-every", type=int, default=1250, help="Validation frequency (steps)")
+    parser.add_argument("--resume", type=str, default=None, help="Specific checkpoint path to resume from")
+    parser.add_argument(
+        "--init-baseline",
+        type=str,
+        default=os.path.join(WORKSPACE_ROOT, "experiments", "extended_train", "ckpt_step_0004284_best.pt"),
+        help="Baseline checkpoint to initialize weights from",
+    )
+    args = parser.parse_args()
+
+    # Auto-discover latest checkpoint in CHECKPOINT_DIR if no explicit resume path is provided
+    resume_path = args.resume
+    if resume_path is None and os.path.isdir(CHECKPOINT_DIR):
+        existing_ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_DIR, "ckpt_step_*.pt")))
+        if existing_ckpts:
+            resume_path = existing_ckpts[-1]
+            print(f"Auto-discovered latest checkpoint to resume: {resume_path}")
+
+    train(
+        max_tokens=args.max_tokens,
+        seq_len=args.seq_len,
+        micro_batch=args.micro_batch,
+        accum_steps=args.accum_steps,
+        max_lr=args.max_lr,
+        min_lr=args.min_lr,
+        warmup_steps=args.warmup_steps,
+        save_every_steps=args.save_every,
+        eval_every_steps=args.eval_every,
+        resume_checkpoint=resume_path,
+        init_from_baseline=args.init_baseline if resume_path is None else None,
+    )
