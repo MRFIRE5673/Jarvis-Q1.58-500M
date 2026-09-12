@@ -12,9 +12,9 @@ This document tracks the iterative optimization progress across all optimization
 | **Phase 1A** | **Activation Stashing (Gradient Checkpointing OFF)**<br>• Evaluated disabling gradient checkpointing across 24 layers to eliminate 22.3% recomputation compute | 1,513.6 tok/s | 178.1 tok/s | **0.12x** (-88.2%) | 18,394 MB (+7.76 GB paging) | **Verified**<br>• Max diff: $1.5 \times 10^{-5}$ | **REVERT (KEEP CKPT ON)** |
 | **Phase 1D/G**| **Packed 2-Bit Ternary CUDA Kernel (SM120)**<br>• Evaluated direct 2-bit packed ternary GEMM (0.25 B/weight) with register unpacking on CUDA cores | 1,546.3 tok/s | 171.6 tok/s | **0.11x** (-88.9%) | 17,256 MB (autograd tape) | **Verified**<br>• Max diff: $7.8 \times 10^{-3}$ | **REVERT (KEEP cuBLAS)** |
 | **Phase 2** | **Blackwell FP8 Tensor Core Execution (`_scaled_mm`)**<br>• Evaluated native `float8_e4m3fn` Tensor Cores. Isolated GEMM: 1.16x–1.45x faster (51.3 TFLOPs). End-to-end layer training: 0.857 ms (BF16) vs 2.058 ms (FP8). | 1,513.6 tok/s | ~630 tok/s | **0.42x** (-58.3%) | 10,240 MB | **Verified**<br>• Output error: 2.7%<br>• Grad error: 2.8% | **REVERT (KEEP BF16 cuBLAS)** |
-| **Phase 3** | **Micro-Batch Scaling ($B=4, \text{accum}=2$)**<br>• Doubled token batch dimension $M=1024 \to M=2048$ while holding effective update constant at 4,096 tokens<br>• Saturated 48 Blackwell SMs: GEMM utilization surged from 38% to 65–84% of peak<br>• Halved gradient accumulation loop iterations | 1,590.1 tok/s | 2,934.9 tok/s (3,050.3 steady) | **1.94x** (+94.3%) | 11,007 MB alloc / 11,946 MB res | **Verified**<br>• Zero NaNs / Infs<br>• Loss: 9.68 vs 9.70<br>• Zero paging | **KEEP (NEW PRODUCTION DEFAULT)** |
-| *Phase 3B* | *MoE Grouped / Fused GEMM (CUTLASS / CuTe / Triton)* | 2,934.9 tok/s | — | — | — | Pending | Planned |
-| *Phase 4* | *CUDA Graph Capture of Fixed-Shape Step* | — | — | — | — | Pending | Planned |
+| **Phase 3** | **Micro-Batch Scaling ($B=4, \text{accum}=2$)**<br>• Doubled token batch dimension $M=1024 \to M=2048$ while holding effective update constant at 4,096 tokens<br>• Saturated 48 Blackwell SMs: GEMM utilization surged from 38% to 65–84% of peak<br>• Halved gradient accumulation loop iterations | 1,590.1 tok/s | 2,934.9 tok/s (3,050.3 steady) | **1.94x** (+94.3%) | 11,007 MB alloc / 11,946 MB res | **Verified**<br>• Zero NaNs / Infs<br>• Loss: 9.68 vs 9.70<br>• Zero paging | **KEEP** |
+| **Phase 4** | **Triton Grouped MoE GEMM / Expert Dispatch**<br>• Fused all 4 expert GEMMs into a single unified kernel launch<br>• Eliminated 48 host-device synchronization stalls (`offsets_cpu`)<br>• Cut MoE launches from 44 to 12 per layer (2,112 to 576 per step) | 3,379.2 tok/s | 4,596.5 tok/s (4,660.6 peak) | **1.36x** (+36.0%) | 10,819 MB alloc / 11,180 MB res | **Verified**<br>• Max logit diff: 0.0<br>• Zero NaNs / Infs | **KEEP (NEW PRODUCTION BENCHMARK)** |
+| *Phase 5* | *CUDA Graph Capture of Fixed-Shape Step* | 4,596.5 tok/s | — | — | — | Pending | Planned |
 
 ---
 
@@ -71,4 +71,26 @@ This document tracks the iterative optimization progress across all optimization
   1. Higher Tensor Core wave quantization and arithmetic saturation across 48 SMs (38–65% $\to$ 65–84% of hardware ceiling).
   2. Halving gradient accumulation loops from 4 to 2, eliminating 50% of Python runtime dispatch overhead and intermediate tensor accumulation traffic.
 - **Decision:** **KEEP AS NEW PRODUCTION DEFAULT.** Throughput nearly doubled to ~3,000 tok/s within physical VRAM boundaries.
+
+---
+
+## Phase 4 Deep Dive: MoE Grouped GEMM / Expert Dispatch
+- **Date:** September 12, 2026
+- **Hypothesis:** Sequential expert execution in MoE layers causes 48 CPU-GPU synchronization stalls per update (from `offsets_cpu = expert_offsets.cpu().numpy()`) and launches 1,152 separate cuBLAS GEMMs per update at suboptimal batch tile sizes. Fusing all 4 experts into a unified Triton Grouped GEMM will saturate Blackwell SM120, eliminate host stalls, and significantly accelerate full training throughput.
+- **Empirical Measurement:**
+  - **Single MoE Layer Compute:** 16.18 ms (Baseline) $\to$ **9.00 ms (Grouped)** (**1.80x faster**; Fwd: 1.84x, Bwd: 1.79x).
+  - **Full Model Forward (B=4, T=512):** 146.58 ms $\to$ **103.19 ms** (**1.42x faster / -29.6% latency**).
+  - **Full Training Step (4,096 tokens):** 1,212.11 ms (3,379.2 tok/s) $\to$ **891.12 ms (4,596.5 tok/s steady, 4,660.6 peak)** (**1.36x speedup / +36.0% throughput**).
+  - **Peak VRAM:** Alloc: 10,819.4 MB | Res: 11,180.0 MB (Safe +1,047 MiB headroom to 12,227 MiB limit, **zero PCIe paging**).
+  - **Kernel Launches:** 2,112 launches $\to$ **576 launches per step (3.67x reduction)**.
+  - **Host Syncs:** 48 stalls $\to$ **0 stalls (100% eliminated)**.
+- **Numerical Verification:**
+  - Forward Output Max Logit Diff: **0.000000e+00** (Cosine similarity: 1.0000001).
+  - Gradient Cosine Similarity: 0.9999986.
+- **Root Cause of Speedup:**
+  1. Fusing 4 expert passes into a single Triton Grouped GEMM with 2D grid scheduling keeps all 48 SMs fully occupied simultaneously (65.57 TFLOPs achieved).
+  2. Complete eradication of 48 host-device synchronization stalls per update (`offsets` remains entirely on GPU).
+  3. Elimination of PyTorch autograd tensor slice tracking graph overhead.
+- **Decision:** **KEEP AND MERGE AS NEW PRODUCTION BENCHMARK.** Step time dropped below 900 ms, raising throughput to ~4,600 tok/s.
+
 

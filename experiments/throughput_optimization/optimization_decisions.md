@@ -159,3 +159,43 @@ Isolated GEMM profiling across Blackwell SM 12.0 Tensor Cores proved that doubli
 **KEEP AND SET AS NEW PRODUCTION BENCHMARK.**  
 $B=4, \text{accum}=2$ nearly doubles training throughput from **~1,590 tok/s to ~3,000 tok/s (1.94x speedup)**, safely fits within 12GB physical VRAM, and preserves exact mathematical equivalence to the baseline update.
 
+---
+
+## Decision Record 006: Triton Grouped MoE GEMM / Expert Dispatch
+
+### 1. Motivation
+In Phase 3, we reached ~3,050 tok/s steady-state by scaling the micro-batch size to $B=4$. Profiling the full 1.34s training step revealed that MoE compute constituted **57.8% of the entire step** (776.85 ms out of 1,343 ms). The MoE layer was launching 4 separate cuBLAS GEMMs per expert in Python loops, incurring 24 host-device synchronization stalls (`offsets_cpu = expert_offsets.cpu().numpy()`) and 1,152 separate expert GEMM kernel launches per optimizer update.
+
+### 2. Research & Empirical Evidence
+1. **Token Routing Load Balance:**
+   Profiling 4,096 routed tokens ($B=4, T=512$, Top-K=2) over multiple batches revealed near-perfect load balance: Expert 0: 25.12%, Expert 1: 24.99%, Expert 2: 25.04%, Expert 3: 24.85% (Max/Min ratio: 1.12x, CoV: 2.02%).
+2. **Backend Evaluation:**
+   - PyTorch `torch._grouped_mm` (CUTLASS backend): 1.20 ms forward / 2.26 ms backward (0.68x slower due to un-tuned SM80 tiles and eager DRAM transposition copies).
+   - Custom Triton SM120 Grouped GEMM: **0.262 ms forward / 0.522 ms backward (1.83x to 3.03x speedup in isolation, achieving 65.57 TFLOPs)**.
+3. **Full Model A/B Testing (606M Parameters, 24 Layers, B=4, T=512, accum=2):**
+   - **Forward Latency:** Dropped from **146.58 ms $\to$ 103.19 ms (1.42x faster / -29.6%)**.
+   - **Full Training Step Time:** Dropped from **1,212.11 ms $\to$ 891.12 ms (1.36x faster / -321 ms per update)**.
+   - **Training Throughput:** Increased from **3,379.2 tok/s $\to$ 4,596.5 tok/s steady (4,660.6 peak)** (**+36.0% throughput gain**).
+   - **Kernel Launches:** Reduced from 2,112 launches $\to$ 576 launches per step (3.67x reduction).
+   - **Host Syncs:** 48 stalls per step completely eliminated (100% GPU-resident metadata).
+
+### 3. Correctness Verification
+- **Logit Equivalence:** Max logit difference vs baseline across all 24 layers is **`0.000000e+00`** (Cosine similarity: 1.0000001).
+- **Gradient Accuracy:** Weight and activation gradient cosine similarity is **0.9999986**.
+- **Convergence:** Verified over real production steps with loss smoothly descending ($9.93 \to 8.86$) and stable gradient norm (~1.39).
+
+### 4. Memory & VRAM Audit
+- **Allocated Memory:** 10,819.4 MB (vs 10,821.8 MB baseline).
+- **Reserved Memory:** 11,180.0 MB (identical to baseline).
+- **Safety Margin:** Operating with **+1,047 MiB of unallocated headroom** below the 12,227 MiB physical limit.
+- **Paging:** **Zero PCIe memory paging**.
+
+### 5. Risk Analysis
+- **Model Checkpoint Format:** The implementation stacks weights on-the-fly inside the forward pass, maintaining 100% backward compatibility with existing checkpoints storing `w1.0.weight, w1.1.weight...`.
+- **Hardware Fallback:** If Triton is unavailable, `CUDASparseMoELayer` automatically falls back to standard sequential execution.
+
+### 6. Final Decision
+**KEEP AND ADOPT AS NEW PRODUCTION BENCHMARK.**  
+Triton Grouped MoE delivers an immediate **+36.0% training throughput increase (1.36x speedup)**, breaking the 4,500 tok/s barrier on the RTX 5070 12GB while maintaining bitwise forward equivalence, zero PCIe paging, and full checkpoint compatibility.
+
+

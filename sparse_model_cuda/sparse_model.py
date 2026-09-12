@@ -33,6 +33,13 @@ try:
 except ImportError:
     _CUDA_AVAILABLE = False
 
+try:
+    import triton
+    import triton.language as tl
+    _TRITON_AVAILABLE = True
+except ImportError:
+    _TRITON_AVAILABLE = False
+
 _CUSTOM_CUDA_EXECUTED = False
 _FALLBACK_USED = False
 
@@ -82,6 +89,162 @@ class MoeScatterCombine(torch.autograd.Function):
             grad_out.contiguous(), dispatched_y, topk_gates, gather_map, gate_idx_map, scatter_map
         )
         return grad_dispatched_y, grad_topk_gates, None, None, None
+
+
+if _TRITON_AVAILABLE:
+    @triton.jit
+    def _grouped_gemm_fwd_kernel(
+        a_ptr, b_ptr, c_ptr,
+        K: tl.constexpr, N: tl.constexpr,
+        stride_am, stride_ak,
+        stride_be, stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        offsets_ptr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        expert_id = tl.program_id(2)
+
+        start_m = tl.load(offsets_ptr + expert_id)
+        end_m = tl.load(offsets_ptr + expert_id + 1)
+        expert_m = end_m - start_m
+
+        if pid_m * BLOCK_M >= expert_m:
+            return
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+
+        a_ptrs = a_ptr + (start_m + offs_m[:, None]) * stride_am + offs_k[None, :] * stride_ak
+        b_ptrs = b_ptr + expert_id * stride_be + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k in range(0, K, BLOCK_K):
+            mask_m = (offs_m[:, None] < expert_m)
+            a = tl.load(a_ptrs, mask=mask_m, other=0.0)
+            b = tl.load(b_ptrs)
+            acc += tl.dot(a, b)
+            a_ptrs += BLOCK_K * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+
+        c_ptrs = c_ptr + (start_m + offs_m[:, None]) * stride_cm + offs_n[None, :] * stride_cn
+        mask_c = (offs_m[:, None] < expert_m) & (offs_n[None, :] < N)
+        tl.store(c_ptrs, acc.to(tl.bfloat16), mask=mask_c)
+
+    @triton.jit
+    def _grouped_gemm_weight_kernel(
+        x_ptr, dy_ptr, dw_ptr,
+        K: tl.constexpr, N: tl.constexpr,
+        stride_xm, stride_xk,
+        stride_dym, stride_dyn,
+        stride_dwe, stride_dwk, stride_dwn,
+        offsets_ptr,
+        BLOCK_K: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_M: tl.constexpr,
+    ):
+        pid_k = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        expert_id = tl.program_id(2)
+
+        start_m = tl.load(offsets_ptr + expert_id)
+        end_m = tl.load(offsets_ptr + expert_id + 1)
+        expert_m = end_m - start_m
+
+        offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_m = tl.arange(0, BLOCK_M)
+
+        acc = tl.zeros((BLOCK_K, BLOCK_N), dtype=tl.float32)
+
+        for m_start in range(0, 8192, BLOCK_M):
+            if m_start < expert_m:
+                curr_offs_m = m_start + offs_m
+                mask_m = curr_offs_m < expert_m
+                x_ptrs = x_ptr + (start_m + curr_offs_m[None, :]) * stride_xm + offs_k[:, None] * stride_xk
+                dy_ptrs = dy_ptr + (start_m + curr_offs_m[:, None]) * stride_dym + offs_n[None, :] * stride_dyn
+
+                x_tile = tl.load(x_ptrs, mask=mask_m[None, :], other=0.0)
+                dy_tile = tl.load(dy_ptrs, mask=mask_m[:, None], other=0.0)
+                acc += tl.dot(x_tile, dy_tile)
+
+        dw_ptrs = dw_ptr + expert_id * stride_dwe + offs_k[:, None] * stride_dwk + offs_n[None, :] * stride_dwn
+        mask_dw = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+        tl.store(dw_ptrs, acc.to(tl.bfloat16), mask=mask_dw)
+
+    def _triton_grouped_gemm(a, b, offsets, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, num_warps=4, num_stages=4):
+        M, K = a.shape
+        E, _, N = b.shape
+        c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N), E)
+        _grouped_gemm_fwd_kernel[grid](
+            a, b, c,
+            K, N,
+            a.stride(0), a.stride(1),
+            b.stride(0), b.stride(1), b.stride(2),
+            c.stride(0), c.stride(1),
+            offsets,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+        return c
+
+    def _triton_grouped_gemm_weight(x, dy, offsets, BLOCK_K=64, BLOCK_N=64, BLOCK_M=64, num_warps=4, num_stages=3):
+        M, K = x.shape
+        _, N = dy.shape
+        E = offsets.shape[0] - 1
+        dw = torch.empty((E, K, N), device=x.device, dtype=torch.bfloat16)
+        grid = (triton.cdiv(K, BLOCK_K), triton.cdiv(N, BLOCK_N), E)
+        _grouped_gemm_weight_kernel[grid](
+            x, dy, dw,
+            K, N,
+            x.stride(0), x.stride(1),
+            dy.stride(0), dy.stride(1),
+            dw.stride(0), dw.stride(1), dw.stride(2),
+            offsets,
+            BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N, BLOCK_M=BLOCK_M,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+        return dw
+
+    class StackedTernarySTE(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, w):
+            alpha = w.abs().mean(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+            w_norm = w / alpha
+            w_q = torch.round(torch.clamp(w_norm, -1.0, 1.0))
+            ctx.save_for_backward(w)
+            return w_q * alpha
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            w, = ctx.saved_tensors
+            mask = (w.abs() <= 1.0).float()
+            return grad_output * mask
+
+    class TritonGroupedMoEMLPFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, w1_q, w2_q, offsets):
+            w1_trans = w1_q.transpose(1, 2).contiguous()
+            h1 = _triton_grouped_gemm(x, w1_trans, offsets)
+            act = F.gelu(h1)
+            w2_trans = w2_q.transpose(1, 2).contiguous()
+            y = _triton_grouped_gemm(act, w2_trans, offsets)
+            ctx.save_for_backward(x, h1, act, w1_q, w2_q, offsets)
+            return y
+
+        @staticmethod
+        def backward(ctx, grad_y):
+            x, h1, act, w1_q, w2_q, offsets = ctx.saved_tensors
+            grad_act = _triton_grouped_gemm(grad_y, w2_q, offsets)
+            grad_w2 = _triton_grouped_gemm_weight(grad_y, act, offsets)
+            with torch.enable_grad():
+                h1_temp = h1.detach().requires_grad_(True)
+                act_temp = F.gelu(h1_temp)
+                grad_h1 = torch.autograd.grad(act_temp, h1_temp, grad_act)[0]
+            grad_x = _triton_grouped_gemm(grad_h1, w1_q, offsets)
+            grad_w1 = _triton_grouped_gemm_weight(grad_h1, x, offsets)
+            return grad_x, grad_w1, grad_w2, None
 
 
 class CUDASparseMoELayer(nn.Module):
@@ -153,15 +316,22 @@ class CUDASparseMoELayer(nn.Module):
             dispatched_x = MoeDispatchGather.apply(x_flat, gather_map, scatter_map, N)
 
             # 4. Expert forward computation on contiguous slices
-            dispatched_y = torch.empty_like(dispatched_x)
-            offsets_cpu = expert_offsets.cpu().numpy()
+            if _TRITON_AVAILABLE and x.is_cuda and x.dtype == torch.bfloat16:
+                w1_stacked = torch.stack([self.w1[e].weight for e in range(self.num_experts)])
+                w2_stacked = torch.stack([self.w2[e].weight for e in range(self.num_experts)])
+                w1_q = StackedTernarySTE.apply(w1_stacked)
+                w2_q = StackedTernarySTE.apply(w2_stacked)
+                dispatched_y = TritonGroupedMoEMLPFunction.apply(dispatched_x, w1_q, w2_q, expert_offsets)
+            else:
+                dispatched_y = torch.empty_like(dispatched_x)
+                offsets_cpu = expert_offsets.cpu().numpy()
 
-            for e in range(self.num_experts):
-                s = int(offsets_cpu[e])
-                e_end = int(offsets_cpu[e + 1])
-                if e_end > s:
-                    xe = dispatched_x[s:e_end]
-                    dispatched_y[s:e_end] = self.w2[e](F.gelu(self.w1[e](xe)))
+                for e in range(self.num_experts):
+                    s = int(offsets_cpu[e])
+                    e_end = int(offsets_cpu[e + 1])
+                    if e_end > s:
+                        xe = dispatched_x[s:e_end]
+                        dispatched_y[s:e_end] = self.w2[e](F.gelu(self.w1[e](xe)))
 
             # 5. Fused scatter combine & gate weighting
             out_flat = MoeScatterCombine.apply(dispatched_y, topk_gates, scatter_map, gather_map, gate_idx_map)
