@@ -12,7 +12,8 @@ This document tracks the iterative optimization progress across all optimization
 | **Phase 1A** | **Activation Stashing (Gradient Checkpointing OFF)**<br>• Evaluated disabling gradient checkpointing across 24 layers to eliminate 22.3% recomputation compute | 1,513.6 tok/s | 178.1 tok/s | **0.12x** (-88.2%) | 18,394 MB (+7.76 GB paging) | **Verified**<br>• Max diff: $1.5 \times 10^{-5}$ | **REVERT (KEEP CKPT ON)** |
 | **Phase 1D/G**| **Packed 2-Bit Ternary CUDA Kernel (SM120)**<br>• Evaluated direct 2-bit packed ternary GEMM (0.25 B/weight) with register unpacking on CUDA cores | 1,546.3 tok/s | 171.6 tok/s | **0.11x** (-88.9%) | 17,256 MB (autograd tape) | **Verified**<br>• Max diff: $7.8 \times 10^{-3}$ | **REVERT (KEEP cuBLAS)** |
 | **Phase 2** | **Blackwell FP8 Tensor Core Execution (`_scaled_mm`)**<br>• Evaluated native `float8_e4m3fn` Tensor Cores. Isolated GEMM: 1.16x–1.45x faster (51.3 TFLOPs). End-to-end layer training: 0.857 ms (BF16) vs 2.058 ms (FP8). | 1,513.6 tok/s | ~630 tok/s | **0.42x** (-58.3%) | 10,240 MB | **Verified**<br>• Output error: 2.7%<br>• Grad error: 2.8% | **REVERT (KEEP BF16 cuBLAS)** |
-| *Phase 2B* | *MoE Grouped / Fused GEMM (CUTLASS / CuTe / Triton)* | 1,467.9 tok/s | — | — | — | Pending | Planned |
+| **Phase 3** | **Micro-Batch Scaling ($B=4, \text{accum}=2$)**<br>• Doubled token batch dimension $M=1024 \to M=2048$ while holding effective update constant at 4,096 tokens<br>• Saturated 48 Blackwell SMs: GEMM utilization surged from 38% to 65–84% of peak<br>• Halved gradient accumulation loop iterations | 1,590.1 tok/s | 2,934.9 tok/s (3,050.3 steady) | **1.94x** (+94.3%) | 11,007 MB alloc / 11,946 MB res | **Verified**<br>• Zero NaNs / Infs<br>• Loss: 9.68 vs 9.70<br>• Zero paging | **KEEP (NEW PRODUCTION DEFAULT)** |
+| *Phase 3B* | *MoE Grouped / Fused GEMM (CUTLASS / CuTe / Triton)* | 2,934.9 tok/s | — | — | — | Pending | Planned |
 | *Phase 4* | *CUDA Graph Capture of Fixed-Shape Step* | — | — | — | — | Pending | Planned |
 
 ---
@@ -51,3 +52,23 @@ This document tracks the iterative optimization progress across all optimization
   - However, in full training (forward + backward), dynamic activation quantization, three `_scaled_mm` calls, and cuBLASLt transposed-stride memory copies increased layer training latency from **0.857 ms (BF16) $\to$ 2.058 ms (FP8)**.
 - **Root Cause:** In eager execution, dynamic scaling and global-DRAM transposition copies take ~1.2 ms per layer, overshadowing the 0.08 ms GEMM compute.
 - **Decision:** **REVERT / KEEP BF16 cuBLAS AS PRODUCTION DEFAULT.** Next optimization target is **Micro-batch tuning ($B=4, \text{accum}=2$)** and **MoE Grouped GEMM**.
+
+---
+
+## Phase 3 Deep Dive: Micro-Batch / Tensor-Core Utilization Sweep
+- **Date:** September 12, 2026
+- **Hypothesis:** At $B=2$ ($M=1024$), cuBLAS GEMM tile sizes under-saturate the 48 SMs of the RTX 5070 Blackwell GPU. Scaling to $B=4$ ($M=2048$) while keeping total tokens per optimizer update at 4,096 ($accum=2$) will dramatically improve Tensor Core arithmetic utilization without exceeding the 12,227 MiB physical VRAM ceiling.
+- **Empirical Measurement:**
+  - **$B=1, \text{accum}=8$:** 5.1352 s/step | **797.6 tok/s** | Peak Alloc: 9,819 MB | Peak Res: 10,190 MB (PASS, 0.50x speedup).
+  - **$B=2, \text{accum}=4$ (Baseline):** 2.5760 s/step | **1,590.1 tok/s** | Peak Alloc: 10,214 MB | Peak Res: 10,520 MB (PASS, 1.00x).
+  - **$B=4, \text{accum}=2$ (Winner):** 1.3956 s/step (1.3428s steady) | **2,934.9 tok/s (3,050.3 steady)** | Peak Alloc: 11,007 MB | Peak Res: 11,946 MB (PASS, 281 MB headroom, zero paging). **1.94x speedup (+94.3%)!**
+  - **$B=8, \text{accum}=1$:** 1.5272 s/step | 2,682.0 tok/s | Peak Res: **12,780 MB** (FAILS: Exceeds 12,227 MiB physical limit $\implies$ Windows WDDM PCIe memory paging).
+- **GEMM Scaling Data:**
+  - Attention ($1024 \times 1024$): $M=1024 \implies 23.76\text{ TFLOPs}$ (38.7% peak) $\to$ $M=2048 \implies \mathbf{39.72\text{ TFLOPs}}$ (64.7% peak, 1.67x TC efficiency).
+  - MoE Up ($1024 \times 2048$): $M=1024 \implies 39.99\text{ TFLOPs}$ (65.1% peak) $\to$ $M=2048 \implies \mathbf{51.09\text{ TFLOPs}}$ (83.2% peak).
+  - MoE Down ($2048 \times 1024$): $M=1024 \implies 32.67\text{ TFLOPs}$ (53.2% peak) $\to$ $M=2048 \implies \mathbf{51.70\text{ TFLOPs}}$ (84.1% peak).
+- **Root Cause of Speedup:**
+  1. Higher Tensor Core wave quantization and arithmetic saturation across 48 SMs (38–65% $\to$ 65–84% of hardware ceiling).
+  2. Halving gradient accumulation loops from 4 to 2, eliminating 50% of Python runtime dispatch overhead and intermediate tensor accumulation traffic.
+- **Decision:** **KEEP AS NEW PRODUCTION DEFAULT.** Throughput nearly doubled to ~3,000 tok/s within physical VRAM boundaries.
+

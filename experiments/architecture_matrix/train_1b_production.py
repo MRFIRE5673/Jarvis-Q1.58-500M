@@ -184,8 +184,8 @@ def load_checkpoint(path, model, optimizer=None, dataloader=None, device="cuda")
 def train(
     max_tokens=1_000_000_000,
     seq_len=512,
-    micro_batch=2,
-    accum_steps=4,
+    micro_batch=4,
+    accum_steps=2,
     max_lr=1.5e-4,
     min_lr=1.5e-5,
     warmup_steps=2000,
@@ -373,8 +373,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Jarvis 1.0B Production Training Engine")
     parser.add_argument("--max-tokens", type=int, default=1_000_000_000, help="Target training tokens")
     parser.add_argument("--seq-len", type=int, default=512, help="Sequence length")
-    parser.add_argument("--micro-batch", type=int, default=2, help="Micro batch size")
-    parser.add_argument("--accum-steps", type=int, default=4, help="Gradient accumulation steps")
+    parser.add_argument("--micro-batch", type=int, default=4, help="Micro batch size (default: 4)")
+    parser.add_argument("--accum-steps", type=int, default=2, help="Gradient accumulation steps (default: 2)")
     parser.add_argument("--max-lr", type=float, default=1.5e-4, help="Peak learning rate")
     parser.add_argument("--min-lr", type=float, default=1.5e-5, help="Minimum learning rate floor")
     parser.add_argument("--warmup-steps", type=int, default=2000, help="Linear warmup steps")
