@@ -95,6 +95,7 @@ def evaluate_validation(model, val_loader, num_batches=32):
     avg_ce = float(sum(ce_list) / max(len(ce_list), 1))
     ppl = math.exp(min(avg_ce, 20.0))
     model.train()
+    torch.cuda.empty_cache()
     return avg_ce, ppl
 
 
@@ -111,11 +112,32 @@ def get_lr_cosine(step, warmup_steps, max_steps, max_lr, min_lr):
 def save_checkpoint(path, model, optimizer, step, tokens_trained, dataloader, best_val_ce, loss_history):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     temp_path = path + ".tmp"
+
+    # Compact model state directly to CPU bfloat16 to avoid GPU VRAM duplication spike
+    sd_bf16 = {
+        k: v.detach().to("cpu", dtype=torch.bfloat16) if v.is_floating_point() else v.detach().to("cpu")
+        for k, v in model.state_dict().items()
+    }
+
+    # Compact optimizer state directly to CPU bfloat16
+    opt_raw = optimizer.state_dict()
+    opt_bf16 = {"state": {}, "param_groups": opt_raw["param_groups"]}
+    for p_idx, p_state in opt_raw["state"].items():
+        opt_bf16["state"][p_idx] = {}
+        for k, v in p_state.items():
+            if isinstance(v, torch.Tensor):
+                if v.is_floating_point():
+                    opt_bf16["state"][p_idx][k] = v.detach().to("cpu", dtype=torch.bfloat16)
+                else:
+                    opt_bf16["state"][p_idx][k] = v.detach().to("cpu")
+            else:
+                opt_bf16["state"][p_idx][k] = v
+
     state = {
         "step": step,
         "tokens_trained": tokens_trained,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
+        "model_state_dict": sd_bf16,
+        "optimizer_state_dict": opt_bf16,
         "dataloader_state": dataloader.get_state(),
         "best_val_ce": best_val_ce,
         "loss_history": loss_history[-200:], # keep recent history
@@ -125,24 +147,32 @@ def save_checkpoint(path, model, optimizer, step, tokens_trained, dataloader, be
     if os.path.exists(path):
         os.remove(path)
     os.rename(temp_path, path)
-    print(f"  [CHECKPOINT SAVED] {path} (Step {step:,}, Tokens {tokens_trained:,})")
+    torch.cuda.empty_cache()
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+    print(f"  [CHECKPOINT SAVED] {path} (Step {step:,}, Tokens {tokens_trained:,}, Size {size_mb:.1f} MB)")
 
 
 def load_checkpoint(path, model, optimizer=None, dataloader=None, device="cuda"):
     print(f"Loading checkpoint from: {path}")
     state = torch.load(path, map_location=device)
-    
+
     sd = state["model_state_dict"]
     clean_sd = {k.replace("_orig_mod.", "", 1) if k.startswith("_orig_mod.") else k: v for k, v in sd.items()}
     model.load_state_dict(clean_sd, strict=False)
-    
+
     if optimizer is not None and "optimizer_state_dict" in state:
-        optimizer.load_state_dict(state["optimizer_state_dict"])
-        
+        opt_sd = state["optimizer_state_dict"]
+        # Restore optimizer momentum tensors to float32
+        for p_idx, p_state in opt_sd["state"].items():
+            for k, v in p_state.items():
+                if isinstance(v, torch.Tensor) and v.is_floating_point():
+                    p_state[k] = v.to(torch.float32)
+        optimizer.load_state_dict(opt_sd)
+
     if dataloader is not None and "dataloader_state" in state:
         dataloader.load_state(state["dataloader_state"])
         print(f"  Dataloader resumed at shard {state['dataloader_state']['current_shard_idx']}, offset {state['dataloader_state']['current_offset']:,}")
-        
+
     step = state.get("step", 0)
     tokens_trained = state.get("tokens_trained", 0)
     best_val_ce = state.get("best_val_ce", float("inf"))
@@ -164,6 +194,10 @@ def train(
     resume_checkpoint=None,
     init_from_baseline=None,
     device="cuda",
+    optimizer_type="adamw",
+    muon_lr=2.0e-3,
+    muon_wd=0.05,
+    use_cuda_attn=True,
 ):
     print("=" * 80)
     print(f"STARTING JARVIS 1.0B TOKEN TRAINING ENGINE")
@@ -178,6 +212,7 @@ def train(
     print(f"  Gradient Accum:  {accum_steps}")
     print(f"  Tokens / Update: {tokens_per_step:,}")
     print(f"  Total Updates:   {total_steps:,} (for {max_tokens:,} tokens)")
+    print(f"  CUDA Attention:  {use_cuda_attn}")
     
     # Initialize model
     model = Jarvis(
@@ -188,18 +223,34 @@ def train(
         num_experts=4,
         top_k=2,
         max_seq_len=seq_len,
-        use_cuda_attn=False, # PyTorch vectorized fallback for stability
+        use_cuda_attn=use_cuda_attn,
         use_cuda_moe=True,
     ).to(device)
     
     # Initialize Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=max_lr,
-        betas=(0.9, 0.95),
-        weight_decay=0.1,
-        fused=True,
-    )
+    if optimizer_type == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=max_lr,
+            betas=(0.9, 0.95),
+            weight_decay=0.1,
+            fused=True,
+        )
+    elif optimizer_type in ("hybrid_muon", "muon"):
+        from jarvis_engine.optimizers import classify_parameter_groups, HybridMuonAdamW
+        param_groups = classify_parameter_groups(
+            model=model,
+            muon_lr=muon_lr,
+            adamw_lr=max_lr,
+            muon_wd=muon_wd,
+            adamw_wd=0.10,
+            muon_momentum=0.95,
+            adamw_betas=(0.9, 0.95),
+            validate=True,
+        )
+        optimizer = HybridMuonAdamW(param_groups)
+    else:
+        raise ValueError(f"Unknown optimizer_type: {optimizer_type}. Choose 'adamw' or 'hybrid_muon'.")
     
     # Initialize Dataloaders
     train_loader = ShardedTokenDataset(
@@ -246,8 +297,13 @@ def train(
     print("\nBeginning training updates...")
     for step in range(start_step + 1, total_steps + 1):
         lr = get_lr_cosine(step, warmup_steps, total_steps, max_lr, min_lr)
-        for g in optimizer.param_groups:
-            g["lr"] = lr
+        if optimizer_type == "adamw":
+            for g in optimizer.param_groups:
+                g["lr"] = lr
+        else:
+            decay_mult = lr / max(max_lr, 1e-8)
+            for g in optimizer.param_groups:
+                g["lr"] = g.get("base_lr", lr) * decay_mult
             
         optimizer.zero_grad(set_to_none=True)
         ce_accum = 0.0
@@ -283,30 +339,33 @@ def train(
             now = time.perf_counter()
             dt = now - t_start
             tok_s = (step - start_step) * tokens_per_step / max(dt, 1e-4)
+            step_tok_s = tokens_per_step / max(t_step_dur, 1e-4)
             alloc_mb = torch.cuda.memory_allocated() / (1024 * 1024)
             res_mb = torch.cuda.memory_reserved() / (1024 * 1024)
             print(
                 f"step {step:06d}/{total_steps:06d}: train_ce {ce_accum:.4f} | lr {lr:.6f} | "
-                f"grad_norm {norm_val:.3f} | {tok_s:,.0f} tok/s | VRAM: {alloc_mb:.0f}M alloc / {res_mb:.0f}M res",
+                f"grad_norm {norm_val:.3f} | {step_tok_s:,.0f} tok/s (avg {tok_s:,.0f}) | VRAM: {alloc_mb:.0f}M alloc / {res_mb:.0f}M res",
                 flush=True
             )
             
         # Periodic validation
+        val_saved = False
         if step % eval_every_steps == 0:
             torch.cuda.synchronize()
             val_ce, val_ppl = evaluate_validation(model, val_loader)
             print(f"\n  -> [VAL @ Step {step:,}] Validation CE: {val_ce:.4f} | PPL: {val_ppl:.2f}", flush=True)
             if val_ce < best_val_ce:
                 best_val_ce = val_ce
-                best_path = os.path.join(CHECKPOINT_DIR, f"ckpt_best_step_{step:06d}.pt")
+                best_path = os.path.join(CHECKPOINT_DIR, "ckpt_best.pt")
                 save_checkpoint(best_path, model, optimizer, step, tokens_trained, train_loader, best_val_ce, loss_history)
+                val_saved = True
             print("", flush=True)
-            
+
         # Periodic checkpoint
-        if step % save_every_steps == 0 or step == total_steps:
-            ckpt_path = os.path.join(CHECKPOINT_DIR, f"ckpt_step_{step:06d}.pt")
+        if (step % save_every_steps == 0 or step == total_steps) and not val_saved:
+            ckpt_path = os.path.join(CHECKPOINT_DIR, "ckpt_latest.pt")
             save_checkpoint(ckpt_path, model, optimizer, step, tokens_trained, train_loader, best_val_ce, loss_history)
-            
+
     print(f"\n[OK] Training completed! Total tokens trained: {tokens_trained:,}")
 
 
@@ -328,15 +387,22 @@ if __name__ == "__main__":
         default=os.path.join(WORKSPACE_ROOT, "experiments", "extended_train", "ckpt_step_0004284_best.pt"),
         help="Baseline checkpoint to initialize weights from",
     )
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "hybrid_muon"], help="Optimizer architecture (default: adamw)")
+    parser.add_argument("--muon-lr", type=float, default=2.0e-3, help="Base learning rate for Muon parameter group")
+    parser.add_argument("--muon-wd", type=float, default=0.05, help="Decoupled weight decay for Muon parameter group")
+    parser.add_argument("--use-cuda-attn", action="store_true", default=True, help="Enable CUDA-accelerated Associative Linear Attention backend")
+    parser.add_argument("--no-cuda-attn", dest="use_cuda_attn", action="store_false", help="Disable CUDA attention and fall back to reference PyTorch")
     args = parser.parse_args()
 
     # Auto-discover latest checkpoint in CHECKPOINT_DIR if no explicit resume path is provided
     resume_path = args.resume
     if resume_path is None and os.path.isdir(CHECKPOINT_DIR):
-        existing_ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_DIR, "ckpt_step_*.pt")))
-        if existing_ckpts:
-            resume_path = existing_ckpts[-1]
-            print(f"Auto-discovered latest checkpoint to resume: {resume_path}")
+        for candidate in ["ckpt_step_002500.pt", "ckpt_latest.pt", "ckpt_best.pt"]:
+            cp = os.path.join(CHECKPOINT_DIR, candidate)
+            if os.path.exists(cp):
+                resume_path = cp
+                print(f"Auto-discovered checkpoint to resume: {resume_path}")
+                break
 
     train(
         max_tokens=args.max_tokens,
@@ -350,4 +416,8 @@ if __name__ == "__main__":
         eval_every_steps=args.eval_every,
         resume_checkpoint=resume_path,
         init_from_baseline=args.init_baseline if resume_path is None else None,
+        optimizer_type=args.optimizer,
+        muon_lr=args.muon_lr,
+        muon_wd=args.muon_wd,
+        use_cuda_attn=args.use_cuda_attn,
     )
