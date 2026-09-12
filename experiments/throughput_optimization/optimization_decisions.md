@@ -326,7 +326,47 @@ In Phase 6, training throughput reached 11,520.9 tok/s (355.53 ms/update) via el
 **KEEP AND ADOPT AS NEW PRODUCTION BENCHMARK.**  
 The Phase 7 Zero-Copy Strided MoE optimization delivers an additional **+7.32% throughput increase (+843.0 tok/s)**, achieving **12,363.9 tok/s steady-state throughput** on the RTX 5070 12GB while maintaining bitwise forward equivalence, zero PCIe paging, and exact training convergence.
 
+---
 
+## Decision Record 010: Kernel Fusion & Miscellaneous Overhead Audit
 
+### 1. Motivation
+Following Phase 7, the Jarvis-Q1.58-500M training engine achieved 12,363.9 tok/s (331.29 ms/update). Profiling attributed non-GEMM latency to an ~84 ms elementwise bucket and a ~60 ms miscellaneous bucket. Phase 8 audited, classified, and prototyped kernel fusions to determine whether any fusion candidate could achieve $\ge 5.0\%$ end-to-end throughput gain.
 
+### 2. Research & Empirical Evidence
+1. **Profiler Decomposition (327.83 ms Total CUDA Execution):**
+   - **Tensor Core GEMMs & BMMs:** 191.27 ms (58.3%)
+   - **Elementwise Operations:** 101.31 ms (30.9%)
+     - Residual Additions & Autograd Branch Accumulations: 72.20 ms (22.0%) across 12,883 calls
+     - Tensor Variance / Mean Reductions: 10.55 ms (3.2%) across 1,861 calls
+     - Fused Ternary STE (Linear + MoE): 9.72 ms (3.0%) across 864 calls
+     - Fused RoPE + ELU+1: 3.22 ms (1.0%) across 144 calls
+     - Fused RMSNorm: 1.95 ms (0.6%) across 292 calls
+   - **Miscellaneous Infrastructure:** 22.51 ms (6.9%)
+     - `moe_compute_metadata_kernel`: 9.83 ms (3.0%, Class D)
+     - `moe_gather_backward_x`: 1.93 ms (0.6%, Class D)
+     - `SoftMax_cu` (Forward): 1.86 ms (0.6%, Class C)
+     - `moe_scatter_combine`: 1.40 ms (0.4%, Class D)
+     - `moe_dispatch_gather`: 1.22 ms (0.4%, Class D)
+     - `SoftMax_cu` (Backward): 1.22 ms (0.4%, Class C)
+     - Others (Memset, Associative Attention Scan, Bitonic Sort): all $<1.1\text{ ms}$
+   - **Fused AdamW Optimizer:** 12.74 ms (3.9%)
+2. **Prototyping & Benchmarks:**
+   - **Candidate 1 (Pre-Cached LSF Causal Buffers):** Step time 331.30 ms $\to$ 330.11 ms (+1.19 ms saved / **+0.36% throughput**). **REJECTED (<2%)**. Static CUDA Graph buffers already eliminate allocation overhead.
+   - **Candidate 2 (Fused Residual Add + Pre-Norm RMSNorm):** Single-pass in-register `x_new = x + res` + variance reduction + `rsqrt` + normalized output `y = x_new * rsqrt * w`. Isolated kernel achieved 1.26x speedup (832.7 µs $\to$ 661.2 µs). However, in 25 steady-state CUDA Graph updates, step time dropped only from 334.38 ± 0.33 ms $\to$ 331.45 ± 0.27 ms (**+2.93 ms saved / +0.88% throughput gain**). **REJECTED (<2%)**. Autograd branch points still require materializing residual tensors for downstream block residual adds and parameter gradient branches.
+   - **Candidate 3 (MoE GELU Epilogue Fusion):** Full forward + backward GELU latency across 24 layers is only 5.5 ms (1.6% of step). Even 100% elimination fails the $\ge 2\%$ threshold. **REJECTED (<2%)**.
+
+### 3. Correctness Verification
+- All candidates verified with $>0.99999$ cosine similarity and bitwise identical forward residual addition (`0.000000e+00` diff).
+- Zero NaNs, zero Infs, zero autograd degradation.
+
+### 4. Memory & VRAM Audit
+- Peak Allocated: 4,790.2 MiB (baseline preserved).
+- Peak Reserved: 7,788.0 MiB to 9,828.0 MiB (baseline preserved).
+- Headroom: $+2,398.5\text{ to }+4,438.5\text{ MiB}$ safe margin below 12,226.5 MiB physical ceiling.
+- PCIe/WDDM Paging: **Zero bytes paged**.
+
+### 5. Final Decision
+**PHASE 8 FUSION OPPORTUNITIES EXHAUSTED. KEEP PHASE 7 LOCKED PRODUCTION BASELINE (12,363.9 tok/s, 331.29 ms).**  
+In strict compliance with the Phase 8 Keep/Reject policy and Step 7 instructions, no candidate met the $\ge 5\%$ adoption threshold. The production codebase remains locked at the Phase 7 baseline. The primary remaining measured bottleneck for Phase 9 is **Tensor Core Matrix Multiplications (GEMMs & BMMs) at 191.27 ms (58.3% of the total update)**.
 

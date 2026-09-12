@@ -14,7 +14,10 @@ This document tracks the iterative optimization progress across all optimization
 | **Phase 2** | **Blackwell FP8 Tensor Core Execution (`_scaled_mm`)**<br>• Evaluated native `float8_e4m3fn` Tensor Cores. Isolated GEMM: 1.16x–1.45x faster (51.3 TFLOPs). End-to-end layer training: 0.857 ms (BF16) vs 2.058 ms (FP8). | 1,513.6 tok/s | ~630 tok/s | **0.42x** (-58.3%) | 10,240 MB | **Verified**<br>• Output error: 2.7%<br>• Grad error: 2.8% | **REVERT (KEEP BF16 cuBLAS)** |
 | **Phase 3** | **Micro-Batch Scaling ($B=4, \text{accum}=2$)**<br>• Doubled token batch dimension $M=1024 \to M=2048$ while holding effective update constant at 4,096 tokens<br>• Saturated 48 Blackwell SMs: GEMM utilization surged from 38% to 65–84% of peak<br>• Halved gradient accumulation loop iterations | 1,590.1 tok/s | 2,934.9 tok/s (3,050.3 steady) | **1.94x** (+94.3%) | 11,007 MB alloc / 11,946 MB res | **Verified**<br>• Zero NaNs / Infs<br>• Loss: 9.68 vs 9.70<br>• Zero paging | **KEEP** |
 | **Phase 4** | **Triton Grouped MoE GEMM / Expert Dispatch**<br>• Fused all 4 expert GEMMs into a single unified kernel launch<br>• Eliminated 48 host-device synchronization stalls (`offsets_cpu`)<br>• Cut MoE launches from 44 to 12 per layer (2,112 to 576 per step) | 3,379.2 tok/s | 4,596.5 tok/s (4,660.6 peak) | **1.36x** (+36.0%) | 10,819 MB alloc / 11,180 MB res | **Verified**<br>• Max logit diff: 0.0<br>• Zero NaNs / Infs | **KEEP (NEW PRODUCTION BENCHMARK)** |
-| *Phase 5* | *CUDA Graph Capture of Fixed-Shape Step* | 4,596.5 tok/s | — | — | — | Pending | Planned |
+| **Phase 5** | **CUDA Graph Capture of Fixed-Shape Step**<br>• Captured 2-microstep gradient checkpointed step into CUDA Graph<br>• Fused AdamW with capturable=True<br>• Cut launches from 25,512 to 1 per step | 4,596.5 tok/s | 10,144.6 tok/s | **2.23x** (+122.9%) | 5,052 MB alloc / 8,492 MB res | **Verified**<br>• Loss: 11.18 vs 11.19<br>• Zero paging | **KEEP** |
+| **Phase 6** | **Elementwise & Ternary STE Fusion Suite**<br>• Triton fused RMSNorm fwd+bwd with in-register rsqrt<br>• Triton fused Ternary STE (Linear + MoE) with IEEE 754 round-half-to-even<br>• Native aten.gelu_backward in MoE backward | 10,129.7 tok/s | 11,520.9 tok/s | **1.137x** (+13.73%) | 4,988 MB alloc / 7,842 MB res | **Verified**<br>• Max diff: 0.000<br>• Zero NaNs / Infs | **KEEP** |
+| **Phase 7** | **Zero-Copy Strided MoE Transposition**<br>• Audited GEMM TFLOPs (62.8-76.9 TFLOPs achieved, 102-125% peak)<br>• Replaced w1_q / w2_q .contiguous() DRAM copies with strided views | 11,520.9 tok/s | 12,363.9 tok/s | **1.073x** (+7.32%) | 6,503 MB alloc / 9,828 MB res | **Verified**<br>• Max logit diff: 0.0<br>• Zero paging | **KEEP** |
+| **Phase 8** | **Kernel Fusion & Miscellaneous Overhead Audit**<br>• Decomposed 101.3 ms elementwise and 22.5 ms misc buckets<br>• Evaluated LSF pre-caching (+0.36%) and fused Add+RMSNorm (+0.88%)<br>• Verified all fusions exhausted under $\ge 5\%$ keep threshold | 12,363.9 tok/s | 12,363.9 tok/s | **1.000x** (Baseline preserved) | 6,503 MB alloc / 9,828 MB res | **Verified**<br>• Stable descent<br>• Zero paging | **EXHAUSTED / KEEP PHASE 7** |
 
 ---
 
@@ -187,7 +190,44 @@ This document tracks the iterative optimization progress across all optimization
   8. MoE Metadata & Routing: ~10.0 ms (3.0%)
 - **Decision:** **KEEP AND MERGE AS NEW PRODUCTION BENCHMARK.** Step time dropped to 331.3 ms, breaking 12,300 tok/s on RTX 5070 12GB.
 
+---
 
-
-
+## Phase 8 Deep Dive: Kernel Fusion + Miscellaneous Overhead Audit
+- **Date:** September 12, 2026
+- **Hypothesis:** Following Phase 7's GEMM optimization, the non-GEMM workload comprised ~84 ms in elementwise operations and ~60 ms in miscellaneous kernels. Fusing adjacent elementwise kernels (e.g. residual addition directly into pre-norm RMSNorm or pre-caching recurrent buffers) will reduce memory traffic, register pressure, and kernel execution time to achieve $\ge 5\%$ full-model throughput improvement.
+- **Empirical Measurement:**
+  - Total CUDA Graph Execution Time Profiled: **327.83 ms**.
+  - **Decomposed Elementwise Bucket (101.31 ms, 30.9%):**
+    1. Residual Additions & Broadcasts: **72.20 ms (22.0%)** across 12,883 calls (primarily autograd backward branch accumulations across 24 layers).
+    2. Tensor Variance / Mean Reductions: **10.55 ms (3.2%)** across 1,861 calls.
+    3. Fused Ternary STE (Linear + MoE): **9.72 ms (3.0%)** across 864 calls (Phase 6 fused).
+    4. Fused RoPE + ELU+1 (Attention): **3.22 ms (1.0%)** across 144 calls.
+    5. Fused RMSNorm (fwd + bwd): **1.95 ms (0.6%)** across 292 calls.
+  - **Decomposed Miscellaneous Bucket (22.51 ms, 6.9%):**
+    1. `moe_compute_metadata_kernel`: **9.83 ms (3.0%, Class D)** (MoE prefix sum, histogram, permutation map).
+    2. `moe_gather_backward_x_kernel`: **1.93 ms (0.6%, Class D)**.
+    3. SoftMax Forward: **1.86 ms (0.6%, Class C)** (cross-entropy vocab reduction).
+    4. `moe_scatter_combine_kernel`: **1.40 ms (0.4%, Class D)**.
+    5. `moe_dispatch_gather_kernel`: **1.22 ms (0.4%, Class D)**.
+    - Top 5 Miscellaneous kernels total **16.24 ms (4.9% of update)**.
+- **Prototyping & Benchmark Results:**
+  1. **Candidate 1 (Pre-Cached LSF Causal Buffers):**
+     - Step Time: 331.30 ms $\to$ 330.11 ms (+1.19 ms saved / **+0.36% throughput**).
+     - Verdict: **REJECT (<2%)**. CUDA Graph capture already pre-allocates static graph buffers.
+  2. **Candidate 2 (Fused Residual Add + Pre-Norm RMSNorm):**
+     - Single-pass in-register `x_new = x + res` + variance reduction + `rsqrt` + normalized output `y = x_new * rsqrt * w`.
+     - Isolated speedup: **1.26x** (832.7 µs $\to$ 661.2 µs, saving 171.5 µs/call). Forward/backward cosine similarity $>0.99999$.
+     - Full Model Step Time (25 steady-state updates): 334.38 ± 0.33 ms $\to$ 331.45 ± 0.27 ms (**+2.93 ms saved / +0.88% throughput gain**).
+     - Verdict: **REJECT (<2%)**. Autograd branch points still require materializing residual tensors for downstream block residual adds and parameter gradient branches.
+  3. **Candidate 3 (MoE GELU Epilogue Fusion):**
+     - Full forward + backward GELU latency across all 24 layers is only **5.5 ms (1.6% of step)**. Even 100% elimination fails the $\ge 2\%$ threshold.
+     - Verdict: **REJECT (<2%)**.
+- **Root Cause & Exhaustion Finding:**
+  1. Phase 6 already fused the highest-value elementwise operations (RMSNorm down to 1.95 ms, Ternary STE down to 9.72 ms).
+  2. Residual additions cannot be fully absorbed in-place without violating autograd gradient branching required by gradient checkpointing and multi-head residual accumulation.
+  3. The miscellaneous bucket is only 22.51 ms (6.9%), distributed across highly efficient specialized C++ kernels with no single kernel exceeding 3.0% of the update.
+- **Decision:**
+  **PHASE 8 FUSION OPPORTUNITIES EXHAUSTED. KEEP PHASE 7 LOCKED PRODUCTION BENCHMARK (12,363.9 tok/s, 331.29 ms).**
+- **Next Measured Bottleneck for Phase 9:**
+  **Tensor Core Matrix Multiplications (GEMMs & BMMs) at 191.27 ms (58.3% of step)** constitute the single dominant bottleneck in the model (Triton Grouped MoE: ~64.4 ms, Dense Attention Projections: ~55.8 ms, LM Head: ~32.4 ms, LSF BMM: ~27.2 ms, Attention Chunk BMM: ~11.5 ms).
 
