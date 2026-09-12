@@ -8,32 +8,35 @@ This document tracks the iterative optimization progress across all optimization
 
 | Iteration | Optimization Description | Before tok/s | After tok/s | Speedup | Peak VRAM | Numerical Correctness | Decision |
 | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **1** | **Restore CUDA Attention & Fix Checkpoint VRAM Paging**<br>• Enabled `CUDAAssociativeLinearAttention` (fused RoPE/ELU + batched Tensor Core BMM + fused scan)<br>• Replaced GPU-side optimizer compaction with CPU-streamed compaction in `save_checkpoint`<br>• Added `torch.cuda.empty_cache()` after eval and checkpointing | 374.0 tok/s | 1,467.9 tok/s | **3.92x** (+292.5%) | 9,422 MB (spikes eliminated) | **Verified**<br>• Max diff vs PyTorch ref: $1.8 \times 10^{-5}$<br>• Zero NaNs / Infs<br>• Gradient norms identical | **KEEP** |
-| *2* | *Profile Step Breakdown & Audit Remaining Compute* (MoE vs Attention vs Fusion) | 1,467.9 tok/s | — | — | — | In Progress | Planned |
-| *3* | *torch.compile / AOTInductor Suitability for Fixed T=512* | — | — | — | — | Pending | Planned |
-| *4* | *Tensor Core Utilization & BF16 Precision Audit* | — | — | — | — | Pending | Planned |
-| *5* | *CUDA Attention Kernel Specialization for T=512* | — | — | — | — | Pending | Planned |
-| *6* | *MoE Routing, Dispatch & Token Packing Fusion* | — | — | — | — | Pending | Planned |
-| *7* | *Microbatch & Gradient Accumulation Grid Tuning* ($B=4, \text{accum}=2$) | — | — | — | — | Pending | Planned |
-| *8* | *Packed 1.58-bit Ternary CUDA Kernel (Long-Term)* | — | — | — | — | Pending | Planned |
+| **1** | **Restore CUDA Attention & Fix Checkpoint VRAM Paging**<br>• Enabled `CUDAAssociativeLinearAttention`<br>• Replaced GPU-side optimizer compaction with CPU streaming<br>• Added `torch.cuda.empty_cache()` post-eval/ckpt | 374.0 tok/s | 1,467.9 tok/s | **3.92x** (+292.5%) | 9,422 MB (spikes eliminated) | **Verified**<br>• Max diff: $1.8 \times 10^{-5}$<br>• Zero NaNs / Infs | **KEEP** |
+| **Phase 1A** | **Activation Stashing (Gradient Checkpointing OFF)**<br>• Evaluated disabling gradient checkpointing across 24 layers to eliminate 22.3% recomputation compute | 1,513.6 tok/s | 178.1 tok/s | **0.12x** (-88.2%) | 18,394 MB (+7.76 GB paging) | **Verified**<br>• Max diff: $1.5 \times 10^{-5}$ | **REVERT (KEEP CKPT ON)** |
+| **Phase 1D/G**| **Packed 2-Bit Ternary CUDA Kernel (SM120)**<br>• Evaluated direct 2-bit packed ternary GEMM (0.25 B/weight) with register unpacking on CUDA cores | 1,546.3 tok/s | 171.6 tok/s | **0.11x** (-88.9%) | 17,256 MB (autograd tape) | **Verified**<br>• Max diff: $7.8 \times 10^{-3}$ | **REVERT (KEEP cuBLAS)** |
+| *Phase 2* | *MoE Grouped / Fused GEMM (CUTLASS / CuTe / Triton)* | 1,467.9 tok/s | — | — | — | Pending | Planned |
+| *Phase 3* | *Blackwell Native FP8 Tensor Cores (122.9–147.5 TFLOPs)* | 1,467.9 tok/s | — | — | — | Pending | Planned |
+| *Phase 4* | *CUDA Graph Capture of Fixed-Shape Step* | — | — | — | — | Pending | Planned |
 
 ---
 
 ## Iteration 1 Deep Dive
-
 - **Date:** September 12, 2026
-- **Hypothesis:** Production training degraded to ~374 tok/s due to (1) algorithmic fallback to unrolled PyTorch einsum loops in `AssociativeLinearAttention` when `use_cuda_attn=False`, and (2) Windows WDDM PCIe paging caused by GPU-side optimizer compaction spiking VRAM above the 12,227 MiB physical ceiling.
-- **Root Causes Confirmed:**
-  1. `train_1b_production.py` had `use_cuda_attn=False` hardcoded.
-  2. `save_checkpoint` duplicated 4.8 GB of optimizer states in VRAM, causing an immediate jump from 9,518 MB to 12,992 MB. PyTorch's reserved allocator held memory above 12.9 GB indefinitely, forcing WDDM to evict memory to host RAM.
-- **Implemented Fixes:**
-  - Defaulted `use_cuda_attn=True` in `train_1b_production.py` with `--no-cuda-attn` CLI fallback flag.
-  - Implemented CPU-streamed state dictionary compaction (`v.detach().to("cpu", dtype=torch.bfloat16)`).
-  - Added `torch.cuda.empty_cache()` post-evaluation and post-checkpoint.
-  - Added instantaneous `step_tok_s` metric to production logging.
-- **Measurements:**
-  - Single-layer block fwd+bwd latency: 56.38 ms $\to$ 28.83 ms (**1.96x**)
-  - Full model update time: 10.95 s $\to$ 2.79 s (**3.92x**)
-  - Throughput: 374.0 tok/s $\to$ **1,467.9 tok/s**
-  - Peak allocated VRAM: 12,992 MB $\to$ **9,422 MB**
-- **Decision:** **KEEP**. Changes committed to `train_1b_production.py`.
+- **Root Cause:** (1) Hardcoded `use_cuda_attn=False` forcing 768 unrolled einsum loop iterations per step. (2) Checkpoint serialization spiking VRAM to 12.99 GB, triggering WDDM PCIe memory paging.
+- **Implemented Fixes:** Enabled `CUDAAssociativeLinearAttention`, CPU-streamed checkpointing, and cache flushing.
+- **Result:** Throughput restored from 374.0 tok/s to **1,467.9 tok/s** (3.92x speedup).
+- **Decision:** **KEEP**.
+
+---
+
+## Phase 1A Deep Dive: Activation Stashing
+- **Date:** September 12, 2026
+- **Hypothesis:** Disabling checkpointing eliminates 24-layer recomputation (saving 22.3% step compute).
+- **Empirical Measurement:** Autograd graph for non-linear neuromorphic layers (attention chunk states, MoE scatter/gather maps, LSF decay tensors) consumed **+7,760.5 MB of persistent VRAM**. Peak VRAM reached **18,394 MB**, causing severe PCIe paging and dropping throughput from **1,513.6 tok/s to 178.1 tok/s (-88.2%)**.
+- **Decision:** **REVERT / KEEP GRADIENT CHECKPOINTING ON.**
+
+---
+
+## Phase 1D/G Deep Dive: Packed Ternary CUDA Kernel
+- **Date:** September 12, 2026
+- **Hypothesis:** 2-bit packed ternary weights ($0.25$ bytes/param) reduce memory bandwidth by 8x.
+- **Empirical Measurement:** Isolated kernel on $1024 \times 1024$ achieved **6.51 TFLOPs** vs. **25.81 TFLOPs** for dense cuBLAS BF16 on Blackwell Tensor Cores. Full model test dropped throughput to **171.6 tok/s**.
+- **Root Cause:** Jarvis training is deeply compute-bound (1,139 FLOPs/Byte vs 114 hardware ridge point). Software unpacking on CUDA cores sacrifices 4x raw Tensor Core compute density to save memory bandwidth that is not bottlenecking the system.
+- **Decision:** **REVERT / DEFER PACKED TERNARY KERNEL FROM PRODUCTION.** Focus low-precision efforts on hardware FP8 Tensor Cores (Phase 3).

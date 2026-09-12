@@ -56,3 +56,43 @@ Enabling the precompiled `CUDAAssociativeLinearAttention` backend and moving opt
 ### 8. Final Decision
 **KEEP AND MERGE.**  
 CUDA attention and CPU-streamed checkpointing are confirmed correct, stable, and deliver an immediate **3.92x speedup** (+292.5% throughput), completely recovering and exceeding the target throughput.
+
+---
+
+## Decision Record 002: Activation Stashing (Disabling Gradient Checkpointing)
+
+### 1. Motivation
+The Phase 0 roofline analysis revealed that gradient checkpointing across 24 layers recomputes 640.9M FLOPs per token during the backward pass (22.3% of total step compute). If intermediate activations could be cached in VRAM without paging, training throughput could increase by ~15–25%.
+
+### 2. Research & Empirical Evidence
+Benchmarked the complete 606M model on RTX 5070 ($B=2, T=512$, accum=4, AdamW fused) with checkpointing ON vs. OFF.
+- Checkpointing ON: 2.7062 s/step, **1,513.6 tok/s**, peak allocated 10,120.7 MB, peak reserved 10,548.0 MB.
+- Checkpointing OFF: 22.9920 s/step, **178.1 tok/s**, peak allocated 17,881.2 MB (+7,760.5 MB), peak reserved 18,394.0 MB.
+
+### 3. Root Cause
+The full autograd tape across 24 layers (including attention chunk states, MoE scatter/gather buffers, expert expansions, and LSF decay tensors) requires **+7.76 GB of persistent activation memory**. Total memory reached 18.4 GB, vastly exceeding the 12,227 MiB physical VRAM limit. Windows WDDM paged gigabytes across PCIe to host RAM, causing an **88.2% performance collapse**.
+
+### 4. Final Decision
+**REJECT ACTIVATION STASHING. KEEP GRADIENT CHECKPOINTING MANDATORY ON 12GB HARDWARE.**
+
+---
+
+## Decision Record 003: Packed 2-Bit Ternary CUDA GEMM
+
+### 1. Motivation
+Current Jarvis layers store weights as floating point numbers scaled by $\alpha \in \{- \alpha, 0, +\alpha\}$. Packing weights into 2 bits per parameter ($0.25$ bytes/param) reduces weight memory bandwidth by 8.0x (e.g. 2,048 KB $\to$ 256 KB for $1024 \times 1024$).
+
+### 2. Research & Empirical Evidence
+Built and compiled a native Blackwell SM120 CUDA extension `ternary_gemm_cuda` implementing 2-bit packing $(00=0, 01=+1, 10=-1)$, fast decoding formula `(code & 1) - (code >> 1)`, shared memory tiling, and register unpacking.
+- **Micro-benchmarks:**
+  - Dense cuBLAS BF16 on Tensor Cores: **25.81 to 40.17 TFLOPs** (0.083 to 0.107 ms).
+  - Packed Ternary on CUDA cores: **6.51 to 7.85 TFLOPs** (0.330 to 0.547 ms).
+  - cuBLAS is **3.9x to 5.1x faster** on exact Jarvis shapes.
+- **Full Model Test:** Replacing attention output projections with the packed ternary kernel reduced training throughput from **1,546.3 tok/s $\to$ 171.6 tok/s (0.11x)**.
+
+### 3. Root Cause
+Jarvis training has an arithmetic intensity of **1,139 to 3,876 FLOPs/Byte**, which is 10x to 34x higher than the RTX 5070 hardware ridge point (114.3 FLOPs/Byte). Because the workload is **compute-bound, not memory-bandwidth bound**, software SIMD unpacking on standard CUDA ALUs sacrifices ~4x raw compute density compared to dedicated hardware Tensor Cores.
+
+### 4. Final Decision
+**REVERT / DEFER CUSTOM PACKED KERNEL FROM PRODUCTION.**  
+Preserve dense cuBLAS Tensor Core execution in production. Direct future low-precision acceleration toward hardware Tensor Core instructions (Native FP8 in Phase 3 and Grouped GEMM in Phase 2).
