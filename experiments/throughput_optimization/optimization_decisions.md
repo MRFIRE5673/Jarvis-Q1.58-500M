@@ -96,3 +96,28 @@ Jarvis training has an arithmetic intensity of **1,139 to 3,876 FLOPs/Byte**, wh
 ### 4. Final Decision
 **REVERT / DEFER CUSTOM PACKED KERNEL FROM PRODUCTION.**  
 Preserve dense cuBLAS Tensor Core execution in production. Direct future low-precision acceleration toward hardware Tensor Core instructions (Native FP8 in Phase 3 and Grouped GEMM in Phase 2).
+
+---
+
+## Decision Record 004: Blackwell Low-Precision Tensor Core Execution (FP8 / NVFP4)
+
+### 1. Motivation
+Blackwell SM 12.0 features 2x higher FP8 Tensor Core throughput (122.9 TFLOPs sustained) and 4x higher NVFP4 throughput (245.8 TFLOPs sustained) compared to BF16 (61.4 TFLOPs). We investigated whether native FP8 or NVFP4 execution in PyTorch/CUDA can accelerate Jarvis training on the RTX 5070.
+
+### 2. Research & Empirical Evidence
+1. **Isolated GEMM (`torch._scaled_mm`):**
+   - On $1024 \times 1024$ and MoE shapes ($1024 \times 2048$), FP8 was **1.16x to 1.45x faster** (up to 51.27 TFLOPs).
+   - NVFP4 Blockwise 1x16 hardware execution verified on SM 12.0, but PyTorch currently lacks a native C++/CUDA dynamic casting kernel (Python software emulation takes ~15.4 ms/matrix).
+2. **Layer Training Step (Forward + Backward):**
+   - Implemented `CustomFP8LinearFunction(torch.autograd.Function)` handling forward and backward passes.
+   - Forward latency: 0.339 ms (BF16) vs. 0.714 ms (FP8) — **2.1x slower**.
+   - Forward + Backward latency: 0.857 ms (BF16) vs. 2.058 ms (FP8) — **2.4x slower**.
+
+### 3. Root Cause
+1. **Dynamic Activation Quantization:** Quantizing activations and gradient outputs on-the-fly requires reduction passes (`abs().max()`) and elementwise scaling, adding ~0.22 ms per matrix.
+2. **cuBLASLt Layout Strides:** cuBLASLt FP8 strictly requires the second operand to be a transposed row-major matrix. Backward passes required three `.t().contiguous()` memory allocations and global DRAM copies.
+3. **Launch Bubbles:** Launching 8 fine-grained kernels per layer on Windows WDDM dwarfs the 0.08 ms GEMM compute.
+
+### 4. Final Decision
+**REVERT / KEEP BF16 cuBLAS AS PRODUCTION DEFAULT.**  
+Eager FP8 layer conversion is uncompetitive for training on SM 12.0 without full graph fusion. Next priority is **Micro-batch tuning ($B=4, \text{accum}=2$)** to boost BF16 Tensor Core occupancy naturally.
