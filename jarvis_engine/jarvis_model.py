@@ -16,6 +16,105 @@ from torch.utils.checkpoint import checkpoint as grad_ckpt
 from utils.ternary_ops import TernaryLinear
 
 
+try:
+    import triton
+    import triton.language as tl
+    _TRITON_RMSNORM_AVAILABLE = True
+except ImportError:
+    _TRITON_RMSNORM_AVAILABLE = False
+
+if _TRITON_RMSNORM_AVAILABLE:
+    @triton.jit
+    def _rmsnorm_fwd_kernel(
+        X_ptr, Y_ptr, W_ptr, Rsqrt_ptr,
+        stride_x_row, stride_y_row,
+        N: tl.constexpr, eps: tl.constexpr, BLOCK_SIZE: tl.constexpr
+    ):
+        row_idx = tl.program_id(0)
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < N
+        
+        x_ptrs = X_ptr + row_idx * stride_x_row + cols
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+        
+        var = tl.sum(x * x, axis=0) / N
+        rsqrt = 1.0 / tl.sqrt(var + eps)
+        tl.store(Rsqrt_ptr + row_idx, rsqrt)
+        
+        w = tl.load(W_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        y = x * rsqrt * w
+        
+        y_ptrs = Y_ptr + row_idx * stride_y_row + cols
+        tl.store(y_ptrs, y.to(tl.bfloat16), mask=mask)
+
+    @triton.jit
+    def _rmsnorm_bwd_dx_kernel(
+        GradY_ptr, X_ptr, W_ptr, Rsqrt_ptr, GradX_ptr,
+        stride_gy_row, stride_x_row, stride_gx_row,
+        N: tl.constexpr, BLOCK_SIZE: tl.constexpr
+    ):
+        row_idx = tl.program_id(0)
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < N
+        
+        gy_ptrs = GradY_ptr + row_idx * stride_gy_row + cols
+        x_ptrs = X_ptr + row_idx * stride_x_row + cols
+        
+        gy = tl.load(gy_ptrs, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        rsqrt = tl.load(Rsqrt_ptr + row_idx).to(tl.float32)
+        
+        x_w_gy = x * w * gy
+        sum_x_w_gy = tl.sum(x_w_gy, axis=0)
+        c = (rsqrt * rsqrt * rsqrt / N) * sum_x_w_gy
+        gx = rsqrt * w * gy - c * x
+        
+        gx_ptrs = GradX_ptr + row_idx * stride_gx_row + cols
+        tl.store(gx_ptrs, gx.to(tl.bfloat16), mask=mask)
+
+    class FusedRMSNormFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, weight, eps=1e-6):
+            orig_shape = x.shape
+            N = orig_shape[-1]
+            x_2d = x.contiguous().view(-1, N)
+            M = x_2d.shape[0]
+            y_2d = torch.empty_like(x_2d)
+            rsqrt = torch.empty(M, dtype=torch.float32, device=x.device)
+            
+            BLOCK_SIZE = triton.next_power_of_2(N)
+            grid = (M,)
+            _rmsnorm_fwd_kernel[grid](
+                x_2d, y_2d, weight, rsqrt,
+                x_2d.stride(0), y_2d.stride(0),
+                N=N, eps=eps, BLOCK_SIZE=BLOCK_SIZE,
+                num_warps=4
+            )
+            ctx.save_for_backward(x_2d, weight, rsqrt)
+            ctx.eps = eps
+            ctx.orig_shape = orig_shape
+            return y_2d.view(orig_shape)
+
+        @staticmethod
+        def backward(ctx, grad_y):
+            x_2d, weight, rsqrt = ctx.saved_tensors
+            M, N = x_2d.shape
+            grad_y_2d = grad_y.contiguous().view(-1, N)
+            grad_x_2d = torch.empty_like(x_2d)
+            
+            BLOCK_SIZE = triton.next_power_of_2(N)
+            grid = (M,)
+            _rmsnorm_bwd_dx_kernel[grid](
+                grad_y_2d, x_2d, weight, rsqrt, grad_x_2d,
+                grad_y_2d.stride(0), x_2d.stride(0), grad_x_2d.stride(0),
+                N=N, BLOCK_SIZE=BLOCK_SIZE,
+                num_warps=4
+            )
+            grad_weight = (grad_y_2d * (x_2d * rsqrt.unsqueeze(1))).sum(dim=0).to(weight.dtype)
+            return grad_x_2d.view(ctx.orig_shape), grad_weight, None
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -23,6 +122,8 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
+        if x.is_cuda and _TRITON_RMSNORM_AVAILABLE:
+            return FusedRMSNormFunction.apply(x, self.weight, self.eps)
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
 

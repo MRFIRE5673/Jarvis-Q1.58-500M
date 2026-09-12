@@ -207,9 +207,61 @@ if _TRITON_AVAILABLE:
         )
         return dw
 
+    @triton.jit
+    def _stacked_ternary_fwd_kernel(
+        W_ptr, Wq_ptr, Alpha_ptr,
+        elements_per_expert, N_total,
+        BLOCK_SIZE: tl.constexpr
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N_total
+        
+        expert_idx = offsets // elements_per_expert
+        alpha = tl.load(Alpha_ptr + expert_idx, mask=mask, other=1.0)
+        
+        w = tl.load(W_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        w_norm = w / alpha
+        w_clamped = tl.maximum(tl.minimum(w_norm, 1.0), -1.0)
+        w_round = tl.extra.cuda.libdevice.nearbyint(w_clamped)
+        w_q = w_round * alpha
+        
+        tl.store(Wq_ptr + offsets, w_q.to(tl.bfloat16), mask=mask)
+
+    @triton.jit
+    def _stacked_ternary_bwd_kernel(
+        GradOut_ptr, W_ptr, GradW_ptr,
+        N_total, BLOCK_SIZE: tl.constexpr
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N_total
+        
+        go = tl.load(GradOut_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        is_valid = tl.abs(w) <= 1.0
+        gw = tl.where(is_valid, go, 0.0)
+        
+        tl.store(GradW_ptr + offsets, gw.to(tl.bfloat16), mask=mask)
+
     class StackedTernarySTE(torch.autograd.Function):
         @staticmethod
         def forward(ctx, w):
+            if w.is_cuda and _TRITON_AVAILABLE:
+                elements_per_expert = w.shape[1] * w.shape[2]
+                N_total = w.numel()
+                alpha = w.abs().mean(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+                wq = torch.empty_like(w)
+                BLOCK_SIZE = 1024
+                grid = (triton.cdiv(N_total, BLOCK_SIZE),)
+                _stacked_ternary_fwd_kernel[grid](
+                    w, wq, alpha,
+                    elements_per_expert, N_total,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    num_warps=4
+                )
+                ctx.save_for_backward(w)
+                return wq
             alpha = w.abs().mean(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
             w_norm = w / alpha
             w_q = torch.round(torch.clamp(w_norm, -1.0, 1.0))
@@ -219,6 +271,17 @@ if _TRITON_AVAILABLE:
         @staticmethod
         def backward(ctx, grad_output):
             w, = ctx.saved_tensors
+            if w.is_cuda and _TRITON_AVAILABLE:
+                grad_w = torch.empty_like(w)
+                N_total = w.numel()
+                BLOCK_SIZE = 1024
+                grid = (triton.cdiv(N_total, BLOCK_SIZE),)
+                _stacked_ternary_bwd_kernel[grid](
+                    grad_output, w, grad_w,
+                    N_total, BLOCK_SIZE=BLOCK_SIZE,
+                    num_warps=4
+                )
+                return grad_w
             mask = (w.abs() <= 1.0).float()
             return grad_output * mask
 
@@ -238,10 +301,7 @@ if _TRITON_AVAILABLE:
             x, h1, act, w1_q, w2_q, offsets = ctx.saved_tensors
             grad_act = _triton_grouped_gemm(grad_y, w2_q, offsets)
             grad_w2 = _triton_grouped_gemm_weight(grad_y, act, offsets)
-            with torch.enable_grad():
-                h1_temp = h1.detach().requires_grad_(True)
-                act_temp = F.gelu(h1_temp)
-                grad_h1 = torch.autograd.grad(act_temp, h1_temp, grad_act)[0]
+            grad_h1 = torch.ops.aten.gelu_backward(grad_act, h1)
             grad_x = _triton_grouped_gemm(grad_h1, w1_q, offsets)
             grad_w1 = _triton_grouped_gemm_weight(grad_h1, x, offsets)
             return grad_x, grad_w1, grad_w2, None
