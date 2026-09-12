@@ -288,11 +288,9 @@ if _TRITON_AVAILABLE:
     class TritonGroupedMoEMLPFunction(torch.autograd.Function):
         @staticmethod
         def forward(ctx, x, w1_q, w2_q, offsets):
-            w1_trans = w1_q.transpose(1, 2).contiguous()
-            h1 = _triton_grouped_gemm(x, w1_trans, offsets)
+            h1 = _triton_grouped_gemm(x, w1_q.transpose(1, 2), offsets)
             act = F.gelu(h1)
-            w2_trans = w2_q.transpose(1, 2).contiguous()
-            y = _triton_grouped_gemm(act, w2_trans, offsets)
+            y = _triton_grouped_gemm(act, w2_q.transpose(1, 2), offsets)
             ctx.save_for_backward(x, h1, act, w1_q, w2_q, offsets)
             return y
 
