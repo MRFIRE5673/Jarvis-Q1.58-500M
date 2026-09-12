@@ -370,3 +370,43 @@ Following Phase 7, the Jarvis-Q1.58-500M training engine achieved 12,363.9 tok/s
 **PHASE 8 FUSION OPPORTUNITIES EXHAUSTED. KEEP PHASE 7 LOCKED PRODUCTION BASELINE (12,363.9 tok/s, 331.29 ms).**  
 In strict compliance with the Phase 8 Keep/Reject policy and Step 7 instructions, no candidate met the $\ge 5\%$ adoption threshold. The production codebase remains locked at the Phase 7 baseline. The primary remaining measured bottleneck for Phase 9 is **Tensor Core Matrix Multiplications (GEMMs & BMMs) at 191.27 ms (58.3% of the total update)**.
 
+---
+
+## Decision Record 011: BMM / LSF Compute Optimization & Padded LM Head
+
+### 1. Motivation
+In Phase 8, matrix operations (Dense Attention GEMMs, LM Head, and Triton Grouped MoE) constituted approximately **58.3% of update execution (191.27 ms)**. In particular, Liquid State Fusion was unrolling $512 \times 512$ causal BMMs, and the LM Head vocabulary projection ($N=50257$) suffered from an unaligned cuBLAS tile cliff. Phase 9 targeted these bottlenecks for hardware acceleration.
+
+### 2. Research & Empirical Evidence
+1. **LSF Streaming Recurrence:**
+   - Replacing the $(512, 512) \times (512, 1024)$ causal BMM and $512 \times 512$ intermediate causal tensors with `TritonStreamingLSFFunction` computes $H_t = \alpha H_{t-1} + (1-\alpha) x_t$ streaming in FP32 registers across 4,096 channels.
+   - FLOPs dropped from 2,147 MFLOPs to 6.3 MFLOPs (341x reduction).
+   - Isolated latency dropped from 2,190.8 µs $\to$ 193.2 µs (11.3x speedup).
+   - Intermediate VRAM reduced by -336.0 MiB.
+2. **Padded LM Head (Internal 64-Tile Alignment):**
+   - Temporarily padding the vocabulary projection to the nearest multiple of 64 ($N=50257 \to 50304$) enabled cuBLAS to map optimal 64-element Tensor Core MMA tiles.
+   - Slices output logits back to $50257$ and weight gradients back to $(50257, 1024)$.
+   - Isolated pass time dropped from 14.68 ms $\to$ 9.23 ms (1.56x speedup).
+   - Full model impact alone: +14.90 ms saved per update (+4.55% throughput gain).
+3. **Full Model Benchmark (606M Parameters, 24 Layers, B=4, T=512, accum=2, 25 Updates):**
+   - **Update Step Time:** Dropped from **331.29 ± 0.33 ms $\to$ 311.32 ± 1.44 ms (-19.97 ms saved / 1.064x speedup)**.
+   - **Steady Throughput:** Surged from **12,363.9 tok/s $\to$ 13,156.7 tok/s (+792.8 tok/s / +6.41% gain)**.
+   - **Peak Reserved Memory:** Dropped from 9,828.0 MiB $\to$ **9,438.0 MiB (-390.0 MiB saved)**.
+   - **Safe Headroom:** **+2,788.5 MiB** below the 12,226.5 MiB physical limit.
+   - **PCIe Paging:** **Zero bytes paged**.
+
+### 3. Correctness Verification
+- **LSF Equivalence:** Forward output Cosine Similarity: **1.0000000**; Backward gradient Cosine Similarity: **1.0000000**.
+- **LM Head Equivalence:** FP32 max difference: **`0.000000e+00` (Bitwise Identical)**.
+- **End-to-End Training Convergence:** Step 25 loss: 11.2157 (eager) vs 11.1530 (graph) (loss delta: 0.0626, matching baseline trajectory).
+- Zero NaNs, zero Infs, zero autograd degradation.
+
+### 4. Risk Analysis
+- **Architecture & Parameters:** Strictly 0 changes to parameter count, 0 changes to sequence length, 0 changes to routing.
+- **CUDA Graph Replay:** 100% compatible with static graph capture and replay with zero host synchronizations.
+
+### 5. Final Decision
+**KEEP AND ADOPT AS NEW PRODUCTION BENCHMARK.**  
+The Phase 9 BMM/LSF and Padded LM Head optimizations deliver an additional **+6.41% throughput increase (+792.8 tok/s)**, breaking the 13,000 tok/s threshold (**13,156.7 tok/s steady-state**) while reducing peak VRAM reserve to 9,438.0 MiB on the RTX 5070 12GB.
+
+

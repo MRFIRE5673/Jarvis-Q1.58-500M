@@ -359,19 +359,192 @@ class SparseMoELayer(nn.Module):
 # α is dynamically derived from the variance of the expert output subset.
 # The membrane potential H must persist across ALL tokens in the sequence.
 # ---------------------------------------------------------------------------
+if _TRITON_RMSNORM_AVAILABLE:
+    @triton.jit
+    def _streaming_lsf_fwd_kernel(
+        X_ptr, H_ptr, H_last_ptr, H0_ptr, Alpha_ptr,
+        stride_xb, stride_xt, stride_xd,
+        stride_hb, stride_ht, stride_hd,
+        stride_lb, stride_ld,
+        stride_0b, stride_0d,
+        B: tl.constexpr, T: tl.constexpr, D: tl.constexpr,
+        has_h0: tl.constexpr, BLOCK_D: tl.constexpr
+    ):
+        pid_d = tl.program_id(0)
+        pid_b = tl.program_id(1)
+        
+        alpha = tl.load(Alpha_ptr).to(tl.float32)
+        one_minus_alpha = 1.0 - alpha
+        
+        col_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask = col_offsets < D
+        
+        if has_h0:
+            h0_ptrs = H0_ptr + pid_b * stride_0b + col_offsets * stride_0d
+            h = tl.load(h0_ptrs, mask=mask, other=0.0).to(tl.float32)
+        else:
+            h = tl.zeros((BLOCK_D,), dtype=tl.float32)
+            
+        x_base = X_ptr + pid_b * stride_xb + col_offsets * stride_xd
+        h_base = H_ptr + pid_b * stride_hb + col_offsets * stride_hd
+        
+        for t in range(0, T):
+            x_ptrs = x_base + t * stride_xt
+            x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+            h = alpha * h + one_minus_alpha * x
+            h_ptrs = h_base + t * stride_ht
+            tl.store(h_ptrs, h.to(tl.bfloat16), mask=mask)
+            
+        h_last_ptrs = H_last_ptr + pid_b * stride_lb + col_offsets * stride_ld
+        tl.store(h_last_ptrs, h.to(tl.bfloat16), mask=mask)
+
+    @triton.jit
+    def _streaming_lsf_bwd_kernel(
+        GradH_ptr, GradHLast_ptr, X_ptr, H_ptr, H0_ptr, Alpha_ptr,
+        GradX_ptr, GradAlpha_block_ptr, GradH0_ptr,
+        stride_ghb, stride_ght, stride_ghd,
+        stride_xb, stride_xt, stride_xd,
+        stride_hb, stride_ht, stride_hd,
+        stride_gxb, stride_gxt, stride_gxd,
+        stride_0b, stride_0d,
+        B: tl.constexpr, T: tl.constexpr, D: tl.constexpr,
+        has_h0: tl.constexpr, has_gh_last: tl.constexpr,
+        BLOCK_D: tl.constexpr
+    ):
+        pid_d = tl.program_id(0)
+        pid_b = tl.program_id(1)
+        
+        alpha = tl.load(Alpha_ptr).to(tl.float32)
+        one_minus_alpha = 1.0 - alpha
+        
+        col_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask = col_offsets < D
+        
+        lambda_val = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        if has_gh_last:
+            gh_last_ptrs = GradHLast_ptr + pid_b * D + col_offsets
+            lambda_val += tl.load(gh_last_ptrs, mask=mask, other=0.0).to(tl.float32)
+            
+        d_alpha_acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        
+        gh_base = GradH_ptr + pid_b * stride_ghb + col_offsets * stride_ghd
+        x_base = X_ptr + pid_b * stride_xb + col_offsets * stride_xd
+        h_base = H_ptr + pid_b * stride_hb + col_offsets * stride_hd
+        gx_base = GradX_ptr + pid_b * stride_gxb + col_offsets * stride_gxd
+        
+        for t in range(T - 1, -1, -1):
+            gh_ptrs = gh_base + t * stride_ght
+            gh = tl.load(gh_ptrs, mask=mask, other=0.0).to(tl.float32)
+            lambda_val = lambda_val + gh
+            
+            gx = one_minus_alpha * lambda_val
+            gx_ptrs = gx_base + t * stride_gxt
+            tl.store(gx_ptrs, gx.to(tl.bfloat16), mask=mask)
+            
+            if t > 0:
+                h_prev_ptrs = h_base + (t - 1) * stride_ht
+                h_prev = tl.load(h_prev_ptrs, mask=mask, other=0.0).to(tl.float32)
+            else:
+                if has_h0:
+                    h0_ptrs = H0_ptr + pid_b * stride_0b + col_offsets * stride_0d
+                    h_prev = tl.load(h0_ptrs, mask=mask, other=0.0).to(tl.float32)
+                else:
+                    h_prev = tl.zeros((BLOCK_D,), dtype=tl.float32)
+                    
+            x_ptrs = x_base + t * stride_xt
+            x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+            d_alpha_acc += lambda_val * (h_prev - x)
+            lambda_val = lambda_val * alpha
+            
+        sum_d_alpha = tl.sum(d_alpha_acc, axis=0)
+        num_blocks_d = tl.cdiv(D, BLOCK_D)
+        block_id = pid_b * num_blocks_d + pid_d
+        tl.store(GradAlpha_block_ptr + block_id, sum_d_alpha)
+        
+        if has_h0:
+            gh0_ptrs = GradH0_ptr + pid_b * stride_0b + col_offsets * stride_0d
+            tl.store(gh0_ptrs, lambda_val.to(tl.bfloat16), mask=mask)
+
+    class TritonStreamingLSFFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, alpha, h0=None):
+            B, T, D = x.shape
+            H = torch.empty_like(x)
+            H_last = torch.empty(B, D, dtype=x.dtype, device=x.device)
+            
+            BLOCK_D = 64
+            num_blocks_d = triton.cdiv(D, BLOCK_D)
+            grid = (num_blocks_d, B)
+            
+            has_h0 = h0 is not None
+            h0_ptr = h0 if has_h0 else x
+            stride_0b = h0.stride(0) if has_h0 else 0
+            stride_0d = h0.stride(1) if has_h0 else 0
+            
+            _streaming_lsf_fwd_kernel[grid](
+                x, H, H_last, h0_ptr, alpha,
+                x.stride(0), x.stride(1), x.stride(2),
+                H.stride(0), H.stride(1), H.stride(2),
+                H_last.stride(0), H_last.stride(1),
+                stride_0b, stride_0d,
+                B=B, T=T, D=D,
+                has_h0=has_h0, BLOCK_D=BLOCK_D,
+                num_warps=2
+            )
+            ctx.save_for_backward(x, H, h0, alpha)
+            ctx.has_h0 = has_h0
+            return H, H_last
+
+        @staticmethod
+        def backward(ctx, grad_H, grad_H_last):
+            x, H, h0, alpha = ctx.saved_tensors
+            B, T, D = x.shape
+            has_h0 = ctx.has_h0
+            has_gh_last = grad_H_last is not None
+            
+            GradX = torch.empty_like(x)
+            GradH0 = torch.empty_like(h0) if has_h0 else None
+            
+            BLOCK_D = 64
+            num_blocks_d = triton.cdiv(D, BLOCK_D)
+            grid = (num_blocks_d, B)
+            
+            GradAlpha_blocks = torch.empty(B * num_blocks_d, dtype=torch.float32, device=x.device)
+            h0_ptr = h0 if has_h0 else x
+            gh0_ptr = GradH0 if has_h0 else x
+            stride_0b = h0.stride(0) if has_h0 else 0
+            stride_0d = h0.stride(1) if has_h0 else 0
+            gh_last_ptr = grad_H_last if has_gh_last else grad_H
+            
+            _streaming_lsf_bwd_kernel[grid](
+                grad_H, gh_last_ptr, x, H, h0_ptr, alpha,
+                GradX, GradAlpha_blocks, gh0_ptr,
+                grad_H.stride(0), grad_H.stride(1), grad_H.stride(2),
+                x.stride(0), x.stride(1), x.stride(2),
+                H.stride(0), H.stride(1), H.stride(2),
+                GradX.stride(0), GradX.stride(1), GradX.stride(2),
+                stride_0b, stride_0d,
+                B=B, T=T, D=D,
+                has_h0=has_h0, has_gh_last=has_gh_last,
+                BLOCK_D=BLOCK_D,
+                num_warps=2
+            )
+            grad_alpha = GradAlpha_blocks.sum().to(alpha.dtype)
+            return GradX, grad_alpha, GradH0
+
+
+# ---------------------------------------------------------------------------
+# LiquidStateFusion (Algo 1 L15, Eq. 8)
+# ---------------------------------------------------------------------------
 class LiquidStateFusion(nn.Module):
     """
-    Leaky Integrate-and-Fire membrane state, parallel causal scan (Algo 1 L15).
+    Leaky Integrate-and-Fire membrane state recurrence (Algo 1 L15).
 
     Mathematical recurrence:
       H_t = α · H_{t-1} + (1 − α) · M_t,  t ∈ [0, T-1]
 
-    Closed-form unrolling:
-      H_t = α^{t+1} · H_{-1} + (1 − α) · Σ_{j≤t} α^{t-j} · M_j
-          = carry_out + (1 − α) · (D @ M)_t
-
-    Where D is the causal lower-triangular decay matrix: D_{t,j} = α^{t-j} for t ≥ j.
-    Executed as a single parallel tensor operation on GPU (66x faster than a Python loop).
+    Executed via high-speed streaming Triton recurrence on GPU, with
+    parallel causal scan fallback on CPU / unsupported backends.
     """
     def __init__(self, d_model, alpha_min=0.1, alpha_max=0.99):
         super().__init__()
@@ -398,7 +571,12 @@ class LiquidStateFusion(nn.Module):
         alpha_raw = torch.sigmoid(-self.var_scale * act_var)
         alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * alpha_raw
 
-        # Parallel causal scan: H_t = α^{t+1} * h_prev + (1 - α) * Σ_{j≤t} α^{t-j} * x_j
+        # Fast path: High-throughput Triton streaming recurrence
+        if x.is_cuda and _TRITON_RMSNORM_AVAILABLE:
+            h_out, h_last = TritonStreamingLSFFunction.apply(x, alpha, h_prev)
+            return h_out, h_last
+
+        # Fallback: Parallel causal scan
         t_idx = torch.arange(T, device=x.device, dtype=torch.float32)
         diff = (t_idx.unsqueeze(1) - t_idx.unsqueeze(0)).clamp(min=0)
         causal = (t_idx.unsqueeze(1) - t_idx.unsqueeze(0) >= 0).to(dtype=x.dtype)
@@ -542,6 +720,44 @@ class JarvisBlock(nn.Module):
         return x, h_last, l_balance, l_reflect
 
 
+# ---------------------------------------------------------------------------
+# Padded LM Head Autograd Function (Internal 64-Tile Alignment)
+# ---------------------------------------------------------------------------
+class PaddedLMHeadFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, pad_n: int):
+        V, K = weight.shape
+        M = x.shape[0]
+        pad_rows = pad_n - V
+        
+        zero_w = torch.zeros(pad_rows, K, dtype=weight.dtype, device=weight.device)
+        w_pad = torch.cat([weight, zero_w], dim=0)
+        
+        logits_pad = F.linear(x, w_pad)
+        logits = logits_pad[:, :V]
+        
+        ctx.save_for_backward(x, w_pad)
+        ctx.V = V
+        ctx.pad_n = pad_n
+        return logits
+
+    @staticmethod
+    def backward(ctx, grad_logits):
+        x, w_pad = ctx.saved_tensors
+        V, pad_n = ctx.V, ctx.pad_n
+        M = grad_logits.shape[0]
+        pad_rows = pad_n - V
+        
+        zero_g = torch.zeros(M, pad_rows, dtype=grad_logits.dtype, device=grad_logits.device)
+        grad_logits_pad = torch.cat([grad_logits, zero_g], dim=1)
+        
+        grad_x = torch.matmul(grad_logits_pad, w_pad)
+        grad_w_pad = torch.matmul(grad_logits_pad.t(), x)
+        grad_w = grad_w_pad[:V, :]
+        
+        return grad_x, grad_w, None
+
+
 class Jarvis(nn.Module):
     def __init__(self, vocab_size=50257, d_model=1024, n_layers=24, n_heads=16,
                  num_experts=4, top_k=2, max_seq_len=1024,
@@ -633,7 +849,14 @@ class Jarvis(nn.Module):
         self._h_states = new_h_states
 
         x = self.final_norm(x)
-        logits = self.lm_head(x)
+        if x.is_cuda and self.lm_head.bias is None and self.lm_head.out_features % 64 != 0:
+            pad_n = ((self.lm_head.out_features + 63) // 64) * 64
+            orig_shape = x.shape
+            x_2d = x.contiguous().view(-1, orig_shape[-1])
+            logits_2d = PaddedLMHeadFunction.apply(x_2d, self.lm_head.weight, pad_n)
+            logits = logits_2d.view(*orig_shape[:-1], self.lm_head.out_features)
+        else:
+            logits = self.lm_head(x)
 
         loss = None
         if targets is not None:
