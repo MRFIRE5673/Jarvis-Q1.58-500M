@@ -344,9 +344,9 @@ class ReflectivePenalty(nn.Module):
         var_penalty = F.relu(act_var - self.tau_max)
         l_reflect = self.lam * (mean_penalty + var_penalty)
 
-        # Update running mean (EMA)
+        # Update running mean (EMA) in-place for CUDA Graph memory stability
         if self.training:
-            self.mu_t = self.ema_decay * self.mu_t + (1.0 - self.ema_decay) * mu_batch.detach()
+            self.mu_t.copy_(self.ema_decay * self.mu_t + (1.0 - self.ema_decay) * mu_batch.detach())
 
         return l_reflect
 
@@ -501,8 +501,8 @@ class Jarvis(nn.Module):
         if persist_state:
             self._token_pos += T
 
-        l_bal_total = torch.tensor(0.0, device=idx.device)
-        l_ref_total = torch.tensor(0.0, device=idx.device)
+        l_bal_total = torch.zeros((), device=idx.device, dtype=torch.float32)
+        l_ref_total = torch.zeros((), device=idx.device, dtype=torch.float32)
 
         # Liquid state persistence (paper Algo 1: H_t survives across sequence boundaries).
         # Training: persist_state=False  — random batches are independent sequences.

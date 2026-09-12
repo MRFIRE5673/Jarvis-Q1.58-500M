@@ -3,6 +3,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <c10/cuda/CUDAStream.h>
 #include <vector>
 #include <string>
 #include <stdexcept>
@@ -325,8 +326,9 @@ std::vector<torch::Tensor> moe_compute_metadata_cuda(
     auto gate_idx_map = torch::empty({M}, options_i32);
 
     int shared_bytes = (num_experts + (num_experts + 1) + num_experts) * sizeof(int);
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-    moe_compute_metadata_kernel<<<1, 256, shared_bytes>>>(
+    moe_compute_metadata_kernel<<<1, 256, shared_bytes, stream>>>(
         topk_idx.data_ptr<int64_t>(),
         expert_counts.data_ptr<int32_t>(),
         expert_offsets.data_ptr<int32_t>(),
@@ -350,16 +352,17 @@ torch::Tensor moe_dispatch_gather_cuda(
     auto dispatched_x = torch::empty({M, C}, x.options());
     int block_size = 256;
     int grid_size = M;
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     if (x.dtype() == torch::kFloat32) {
-        moe_dispatch_gather_kernel<float><<<grid_size, block_size>>>(
+        moe_dispatch_gather_kernel<float><<<grid_size, block_size, 0, stream>>>(
             x.data_ptr<float>(),
             gather_map.data_ptr<int32_t>(),
             dispatched_x.data_ptr<float>(),
             M, C
         );
     } else if (x.dtype() == torch::kBFloat16) {
-        moe_dispatch_gather_kernel<at::BFloat16><<<grid_size, block_size>>>(
+        moe_dispatch_gather_kernel<at::BFloat16><<<grid_size, block_size, 0, stream>>>(
             x.data_ptr<at::BFloat16>(),
             gather_map.data_ptr<int32_t>(),
             dispatched_x.data_ptr<at::BFloat16>(),
@@ -382,9 +385,10 @@ torch::Tensor moe_scatter_combine_cuda(
     auto out = torch::empty({N, C}, dispatched_y.options());
     int block_size = 256;
     int grid_size = N;
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     if (dispatched_y.dtype() == torch::kFloat32) {
-        moe_scatter_combine_kernel<float><<<grid_size, block_size>>>(
+        moe_scatter_combine_kernel<float><<<grid_size, block_size, 0, stream>>>(
             dispatched_y.data_ptr<float>(),
             topk_gates.data_ptr<float>(),
             scatter_map.data_ptr<int32_t>(),
@@ -392,7 +396,7 @@ torch::Tensor moe_scatter_combine_cuda(
             N, K, C
         );
     } else if (dispatched_y.dtype() == torch::kBFloat16) {
-        moe_scatter_combine_kernel<at::BFloat16><<<grid_size, block_size>>>(
+        moe_scatter_combine_kernel<at::BFloat16><<<grid_size, block_size, 0, stream>>>(
             dispatched_y.data_ptr<at::BFloat16>(),
             topk_gates.data_ptr<at::BFloat16>(),
             scatter_map.data_ptr<int32_t>(),
@@ -418,10 +422,11 @@ std::vector<torch::Tensor> moe_scatter_backward_cuda(
     auto grad_topk_gates = torch::empty({N, K}, topk_gates.options());
 
     int block_size = 256;
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     // 1. grad_dispatched_y
     if (grad_out.dtype() == torch::kFloat32) {
-        moe_scatter_backward_y_kernel<float><<<M, block_size>>>(
+        moe_scatter_backward_y_kernel<float><<<M, block_size, 0, stream>>>(
             grad_out.data_ptr<float>(),
             topk_gates.data_ptr<float>(),
             gather_map.data_ptr<int32_t>(),
@@ -430,7 +435,7 @@ std::vector<torch::Tensor> moe_scatter_backward_cuda(
             M, K, C
         );
     } else if (grad_out.dtype() == torch::kBFloat16) {
-        moe_scatter_backward_y_kernel<at::BFloat16><<<M, block_size>>>(
+        moe_scatter_backward_y_kernel<at::BFloat16><<<M, block_size, 0, stream>>>(
             grad_out.data_ptr<at::BFloat16>(),
             topk_gates.data_ptr<at::BFloat16>(),
             gather_map.data_ptr<int32_t>(),
@@ -444,7 +449,7 @@ std::vector<torch::Tensor> moe_scatter_backward_cuda(
     // 2. grad_topk_gates
     dim3 grid_gates(N, K);
     if (grad_out.dtype() == torch::kFloat32) {
-        moe_scatter_backward_gates_kernel<float><<<grid_gates, block_size>>>(
+        moe_scatter_backward_gates_kernel<float><<<grid_gates, block_size, 0, stream>>>(
             grad_out.data_ptr<float>(),
             dispatched_y.data_ptr<float>(),
             scatter_map.data_ptr<int32_t>(),
@@ -452,7 +457,7 @@ std::vector<torch::Tensor> moe_scatter_backward_cuda(
             N, K, C
         );
     } else if (grad_out.dtype() == torch::kBFloat16) {
-        moe_scatter_backward_gates_kernel<at::BFloat16><<<grid_gates, block_size>>>(
+        moe_scatter_backward_gates_kernel<at::BFloat16><<<grid_gates, block_size, 0, stream>>>(
             grad_out.data_ptr<at::BFloat16>(),
             dispatched_y.data_ptr<at::BFloat16>(),
             scatter_map.data_ptr<int32_t>(),
@@ -474,16 +479,17 @@ torch::Tensor moe_gather_backward_cuda(
     auto grad_x = torch::empty({N, C}, grad_dispatched_x.options());
     int block_size = 256;
     int grid_size = N;
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     if (grad_dispatched_x.dtype() == torch::kFloat32) {
-        moe_gather_backward_x_kernel<float><<<grid_size, block_size>>>(
+        moe_gather_backward_x_kernel<float><<<grid_size, block_size, 0, stream>>>(
             grad_dispatched_x.data_ptr<float>(),
             scatter_map.data_ptr<int32_t>(),
             grad_x.data_ptr<float>(),
             N, K, C
         );
     } else if (grad_dispatched_x.dtype() == torch::kBFloat16) {
-        moe_gather_backward_x_kernel<at::BFloat16><<<grid_size, block_size>>>(
+        moe_gather_backward_x_kernel<at::BFloat16><<<grid_size, block_size, 0, stream>>>(
             grad_dispatched_x.data_ptr<at::BFloat16>(),
             scatter_map.data_ptr<int32_t>(),
             grad_x.data_ptr<at::BFloat16>(),

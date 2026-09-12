@@ -93,4 +93,31 @@ This document tracks the iterative optimization progress across all optimization
   3. Elimination of PyTorch autograd tensor slice tracking graph overhead.
 - **Decision:** **KEEP AND MERGE AS NEW PRODUCTION BENCHMARK.** Step time dropped below 900 ms, raising throughput to ~4,600 tok/s.
 
+---
+
+## Phase 5 Deep Dive: CUDA Graph Capture + Kernel Launch Elimination
+- **Date:** September 12, 2026
+- **Hypothesis:** Fine-grained profiling shows that **55.28% of the training update** (507.06 ms out of 917.21 ms) is consumed by CPU submission latency and inter-kernel dispatch bubbles under Windows WDDM across 25,512 kernel launches per step. Capturing the full training step (2 microsteps + gradient checkpointing + Triton MoE + fused AdamW) into a single CUDA Graph will eliminate inter-kernel bubbles and accelerate training toward the hardware compute roof.
+- **Empirical Measurement:**
+  - **Full Training Step (4,096 tokens):** 899.88 ms (4,551.7 tok/s) $\to$ **403.76 ms (10,144.6 tok/s)** (**2.23x speedup / +122.9% throughput increase**).
+  - **Kernel Launches:** 25,512 launches $\to$ **1 graph launch per step (-99.99%)**.
+  - **CPU Utilization:** 19.9% $\to$ **8.0% (-11.9% load reduction)**.
+  - **Peak VRAM:** Alloc: 5,052.1 MiB | Res: 8,492.0 MiB (**+3,734.6 MiB of unallocated headroom** below 12,226.5 MiB cap, **zero PCIe paging**).
+  - **Step Time Variance:** Reduced from ±26.16 ms $\to$ **±0.31 ms (zero jitter)**.
+- **Numerical Verification:**
+  - Max Parameter Diff: $1.8311 \times 10^{-3}$, RMSE: $3.6103 \times 10^{-4}$.
+  - Step 25 Loss: 11.1828 (Eager) vs 11.1904 (Graph) (loss delta: 0.0075, matching within BF16 floating-point stochastic tolerance).
+- **Blockers Resolved:**
+  1. Propagated `c10::cuda::getCurrentCUDAStream()` to all 10 custom C++ kernel launches in `associative_attention_cuda` and `sparse_model_cuda`.
+  2. Changed `mu_t` EMA update to in-place `copy_()` to preserve static tensor memory addresses.
+  3. Enabled `capturable=True` in fused AdamW.
+  4. Shared graph memory pool (`s_graph.query_cuda_graph_pool()`) to prevent duplicate activation reserve and avoid WDDM PCIe paging.
+- **Next Measured Bottleneck:**
+  Profiling the remaining 401.56 ms GPU compute shows:
+  1. Dense Attention Projections & Output GEMMs: ~91.0 ms (22.7%)
+  2. Elementwise STE Quantization & Activations: ~118.0 ms (29.4%)
+  3. Triton Grouped MoE (fwd + bwd): 87.83 ms (21.9%)
+- **Decision:** **KEEP AND MERGE AS NEW PRODUCTION BENCHMARK.** Breakthrough performance: training throughput surpassed 10,000 tok/s (10,144 tok/s) on RTX 5070 12GB.
+
+
 

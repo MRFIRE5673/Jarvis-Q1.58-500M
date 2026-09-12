@@ -2,6 +2,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <c10/cuda/CUDAStream.h>
 #include <vector>
 #include <cmath>
 
@@ -360,11 +361,12 @@ std::vector<at::Tensor> fused_rope_elu_forward_cuda(
     const int total_tokens = B * H * T;
     const int threads_per_block = half_D; // 32 threads per token (1 warp)
     const int blocks = total_tokens;
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         q.scalar_type(), "fused_rope_elu_forward_kernel", ([&] {
-            fused_rope_elu_forward_kernel<scalar_t><<<blocks, threads_per_block>>>(
+            fused_rope_elu_forward_kernel<scalar_t><<<blocks, threads_per_block, 0, stream>>>(
                 q.data_ptr<scalar_t>(),
                 k.data_ptr<scalar_t>(),
                 cos_tab.data_ptr<scalar_t>(),
@@ -401,11 +403,12 @@ std::vector<at::Tensor> fused_rope_elu_backward_cuda(
     const int total_tokens = B * H * T;
     const int threads_per_block = half_D;
     const int blocks = total_tokens;
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         q_in.scalar_type(), "fused_rope_elu_backward_kernel", ([&] {
-            fused_rope_elu_backward_kernel<scalar_t><<<blocks, threads_per_block>>>(
+            fused_rope_elu_backward_kernel<scalar_t><<<blocks, threads_per_block, 0, stream>>>(
                 grad_q_out.data_ptr<scalar_t>(),
                 grad_k_out.data_ptr<scalar_t>(),
                 q_in.data_ptr<scalar_t>(),
@@ -438,6 +441,7 @@ std::vector<at::Tensor> recurrent_chunk_state_scan_forward_cuda(
 
     const int blocks = B * H;
     const int threads_per_block = 256;
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     auto gamma_c_float = gamma_c.contiguous().to(at::kFloat);
 
@@ -447,7 +451,7 @@ std::vector<at::Tensor> recurrent_chunk_state_scan_forward_cuda(
             const scalar_t* h_prev_ptr = h_prev_opt.defined() && h_prev_opt.numel() > 0
                 ? h_prev_opt.data_ptr<scalar_t>() : nullptr;
 
-            recurrent_chunk_state_scan_forward_kernel<scalar_t><<<blocks, threads_per_block>>>(
+            recurrent_chunk_state_scan_forward_kernel<scalar_t><<<blocks, threads_per_block, 0, stream>>>(
                 delta_S.data_ptr<scalar_t>(),
                 gamma_c_float.data_ptr<float>(),
                 h_prev_ptr,
@@ -479,6 +483,7 @@ std::vector<at::Tensor> recurrent_chunk_state_scan_backward_cuda(
 
     const int blocks = B * H;
     const int threads_per_block = 256;
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     auto gamma_c_float = gamma_c.contiguous().to(at::kFloat);
 
@@ -489,7 +494,7 @@ std::vector<at::Tensor> recurrent_chunk_state_scan_backward_cuda(
                 ? grad_h_last_opt.data_ptr<scalar_t>() : nullptr;
             scalar_t* grad_prev_ptr = return_grad_h_prev ? grad_h_prev.data_ptr<scalar_t>() : nullptr;
 
-            recurrent_chunk_state_scan_backward_kernel<scalar_t><<<blocks, threads_per_block>>>(
+            recurrent_chunk_state_scan_backward_kernel<scalar_t><<<blocks, threads_per_block, 0, stream>>>(
                 grad_all_states.data_ptr<scalar_t>(),
                 grad_last_ptr,
                 all_states.data_ptr<scalar_t>(),
