@@ -37,6 +37,7 @@ __pycache__/
 *$py.class
 *.so
 *.pyd
+*.obj
 .Python
 build/
 develop-eggs/
