@@ -190,6 +190,11 @@ FullModelWorkspace allocate_full_workspace(const FullJarvisConfig& cfg) {
     // Optimizer reduction buffer
     alloc_f32(ws.grad_norm_sq, 1);
     alloc_f32(ws.clip_coef, 1);
+    alloc_f32(ws.lsf_alpha_buf, 1);
+    alloc_f32(ws.lsf_mean_var_buf, 2);
+    alloc_f32(ws.lsf_grad_alpha_buf, 64);
+    alloc_f32(ws.d_gamma_c, 16);
+    ws.step_count = 0;
     
     // EXP-24-010 Consolidated Grouped AdamW Pointer Tables
     CHECK_CUDA(cudaMalloc(&ws.d_all_moe_experts, 192 * 4 * sizeof(void*)));
@@ -324,6 +329,10 @@ void free_full_workspace(FullModelWorkspace& ws) {
     
     free_p((void*&)ws.grad_norm_sq);
     free_p((void*&)ws.clip_coef);
+    free_p((void*&)ws.lsf_alpha_buf);
+    free_p((void*&)ws.lsf_mean_var_buf);
+    free_p((void*&)ws.lsf_grad_alpha_buf);
+    free_p((void*&)ws.d_gamma_c);
     
     free_p(ws.d_all_moe_experts);
     free_p(ws.d_all_qkv);

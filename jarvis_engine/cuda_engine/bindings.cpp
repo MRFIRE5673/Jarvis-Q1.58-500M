@@ -8,6 +8,7 @@
 #include "cublaslt_engine.h"
 #include "attention.h"
 #include "moe.h"
+#include "liquid_state_fusion.h"
 #include <cuda_fp8.h>
 
 void launch_quantize_bf16_to_fp8(
@@ -26,6 +27,8 @@ void run_full_model_backward(
     const FullJarvisConfig& cfg,
     FullModelWorkspace& ws,
     FullModelParameters& params,
+    bool is_first_step,
+    bool is_final_step,
     cudaStream_t stream
 );
 
@@ -42,6 +45,7 @@ static FullJarvisConfig g_cfg;
 static FullModelWorkspace g_ws;
 static FullModelParameters g_params;
 static CUDAGraphContext g_graph_ctx;
+static cudaStream_t g_capture_stream = nullptr;
 static bool g_engine_initialized = false;
 
 void cleanup_full_engine();
@@ -235,6 +239,10 @@ void cleanup_full_engine() {
     cleanup_cublaslt_engine();
     free_full_workspace(g_ws);
     destroy_graph(g_graph_ctx);
+    if (g_capture_stream) {
+        cudaStreamDestroy(g_capture_stream);
+        g_capture_stream = nullptr;
+    }
     g_engine_initialized = false;
 }
 
@@ -384,37 +392,74 @@ float train_step_interleaved_eager(float lr) {
 
 void capture_full_graph(float lr) {
     TORCH_CHECK(g_engine_initialized, "Engine not initialized");
-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
     
     if (g_graph_ctx.is_captured) {
         destroy_graph(g_graph_ctx);
     }
     
-    // Warmup prior to capture
-    for (int i = 0; i < 3; ++i) {
-        train_step(lr);
+    if (!g_capture_stream) {
+        cudaError_t s_err = cudaStreamCreateWithFlags(&g_capture_stream, cudaStreamNonBlocking);
+        TORCH_CHECK(s_err == cudaSuccess, "cudaStreamCreateWithFlags failed: ", cudaGetErrorString(s_err));
     }
-    cudaStreamSynchronize(stream);
     
-    cudaGraphCreate(&g_graph_ctx.graph, 0);
-    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+    // Warmup prior to capture on dedicated stream
+    cudaMemsetAsync(g_ws.loss_buffer, 0, sizeof(float), g_capture_stream);
+    run_native_training_step(g_cfg, g_ws, g_params, lr, g_capture_stream);
+    cudaStreamSynchronize(g_capture_stream);
     
-    train_step(lr);
+    cudaError_t beg_err = cudaStreamBeginCapture(g_capture_stream, cudaStreamCaptureModeRelaxed);
+    TORCH_CHECK(beg_err == cudaSuccess, "cudaStreamBeginCapture failed: ", cudaGetErrorString(beg_err));
     
-    cudaStreamEndCapture(stream, &g_graph_ctx.graph);
-    cudaGraphInstantiate(&g_graph_ctx.instance, g_graph_ctx.graph, NULL, NULL, 0);
+    cudaMemsetAsync(g_ws.loss_buffer, 0, sizeof(float), g_capture_stream);
+    run_native_training_step(g_cfg, g_ws, g_params, lr, g_capture_stream);
+    
+    cudaError_t end_err = cudaStreamEndCapture(g_capture_stream, &g_graph_ctx.graph);
+    TORCH_CHECK(end_err == cudaSuccess, "cudaStreamEndCapture failed: ", cudaGetErrorString(end_err));
+    cudaError_t inst_err = cudaGraphInstantiate(&g_graph_ctx.instance, g_graph_ctx.graph, NULL, NULL, 0);
+    TORCH_CHECK(inst_err == cudaSuccess, "cudaGraphInstantiate failed: ", cudaGetErrorString(inst_err));
     g_graph_ctx.is_captured = true;
 }
 
 void replay_graph() {
     TORCH_CHECK(g_graph_ctx.is_captured, "CUDA Graph not captured. Call capture_full_graph first.");
-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = g_capture_stream ? g_capture_stream : c10::cuda::getCurrentCUDAStream().stream();
     replay_graph_step(g_graph_ctx, stream);
 }
 
 float train_step_graph() {
     replay_graph();
-    return get_loss();
+    cudaStream_t stream = g_capture_stream ? g_capture_stream : c10::cuda::getCurrentCUDAStream().stream();
+    float host_loss = 0.0f;
+    cudaMemcpyAsync(&host_loss, g_ws.loss_buffer, sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    return host_loss;
+}
+
+void forward_step() {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    cudaMemsetAsync(g_ws.loss_buffer, 0, sizeof(float), stream);
+    run_full_model_forward(g_cfg, g_ws, g_params, stream);
+}
+
+void backward_step(bool is_first_step, bool is_final_step) {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    run_full_model_backward(g_cfg, g_ws, g_params, is_first_step, is_final_step, stream);
+}
+
+void optimizer_step(float lr) {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    run_fused_optimizer_step(g_params, g_ws, g_cfg, lr, stream);
+}
+
+torch::Tensor get_logits() {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    torch::Tensor logits = torch::empty({g_cfg.M(), g_cfg.vocab_pad}, opts);
+    cudaMemcpy(logits.data_ptr(), g_ws.logits, (size_t)g_cfg.M() * g_cfg.vocab_pad * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    return logits.slice(1, 0, g_cfg.vocab_size);
 }
 
 // Component 3: Isolated Attention Forward Test Binding
@@ -537,6 +582,113 @@ std::vector<torch::Tensor> get_all_layer_gradients(int layer_idx) {
     }
     
     return grads;
+}
+
+std::vector<torch::Tensor> get_global_gradients() {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    
+    // 0: d_tok_emb (vocab_size, C)
+    torch::Tensor d_tok = torch::empty({g_cfg.vocab_size, g_cfg.C}, opts);
+    cudaMemcpy(d_tok.data_ptr(), g_params.d_tok_emb_weight, (size_t)g_cfg.vocab_size * g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    
+    // 1: d_final_norm (C)
+    torch::Tensor d_fn = torch::empty({g_cfg.C}, opts);
+    cudaMemcpy(d_fn.data_ptr(), g_params.d_final_norm_weight, (size_t)g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    
+    // 2: d_lm_head (vocab_pad, C)
+    torch::Tensor d_lm = torch::empty({g_cfg.vocab_pad, g_cfg.C}, opts);
+    cudaMemcpy(d_lm.data_ptr(), g_params.d_lm_head_weight, (size_t)g_cfg.vocab_pad * g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    
+    return {d_tok, d_fn, d_lm};
+}
+
+std::vector<torch::Tensor> get_layer_scalar_gradients(int layer_idx) {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    TORCH_CHECK(layer_idx >= 0 && layer_idx < g_cfg.num_layers, "Invalid layer index");
+    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    auto& lay = g_params.layers[layer_idx];
+    
+    // d_gamma_raw (H)
+    torch::Tensor d_gamma = torch::empty({g_cfg.H}, opts_f32);
+    cudaMemcpy(d_gamma.data_ptr(), lay.d_gamma_raw, (size_t)g_cfg.H * sizeof(float), cudaMemcpyDeviceToDevice);
+    
+    // d_var_scale (1)
+    torch::Tensor d_var = torch::empty({1}, opts_f32);
+    cudaMemcpy(d_var.data_ptr(), lay.d_var_scale, sizeof(float), cudaMemcpyDeviceToDevice);
+    
+    return {d_gamma, d_var};
+}
+
+std::vector<torch::Tensor> test_lsf_forward(torch::Tensor moe_out, int layer_idx) {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    TORCH_CHECK(layer_idx >= 0 && layer_idx < g_cfg.num_layers, "Invalid layer index");
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    auto& lay = g_params.layers[layer_idx];
+    int M = g_cfg.M();
+    int C = g_cfg.C;
+    
+    cudaMemcpyAsync(g_ws.layer_moe_out, moe_out.data_ptr(), (size_t)M * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+    launch_liquid_state_fusion_fwd(
+        g_ws.layer_moe_out, lay.var_scale, g_ws.layer_h_out, g_ws.layer_h_last[layer_idx], nullptr,
+        g_ws.lsf_alpha_buf, g_ws.lsf_mean_var_buf, g_cfg.B, g_cfg.T, C, stream
+    );
+    cudaStreamSynchronize(stream);
+    
+    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    
+    torch::Tensor h_out = torch::empty({M, C}, opts_bf16);
+    cudaMemcpy(h_out.data_ptr(), g_ws.layer_h_out, (size_t)M * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    
+    torch::Tensor h_last = torch::empty({g_cfg.B, C}, opts_bf16);
+    cudaMemcpy(h_last.data_ptr(), g_ws.layer_h_last[layer_idx], (size_t)g_cfg.B * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    
+    torch::Tensor alpha = torch::empty({1}, opts_f32);
+    cudaMemcpy(alpha.data_ptr(), g_ws.lsf_alpha_buf, sizeof(float), cudaMemcpyDeviceToDevice);
+    
+    return {h_out, h_last, alpha};
+}
+
+std::vector<torch::Tensor> test_lsf_backward(torch::Tensor grad_h, int layer_idx) {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    TORCH_CHECK(layer_idx >= 0 && layer_idx < g_cfg.num_layers, "Invalid layer index");
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    auto& lay = g_params.layers[layer_idx];
+    int M = g_cfg.M();
+    int C = g_cfg.C;
+    
+    cudaMemsetAsync(lay.d_var_scale, 0, sizeof(float), stream);
+    const __nv_bfloat16* grad_h_ptr = reinterpret_cast<const __nv_bfloat16*>(grad_h.data_ptr<at::BFloat16>());
+    
+    launch_liquid_state_fusion_bwd(
+        grad_h_ptr, g_ws.layer_moe_out, g_ws.layer_h_out, nullptr,
+        lay.var_scale, g_ws.lsf_mean_var_buf, g_ws.lsf_alpha_buf,
+        g_ws.d_layer_moe_out, lay.d_var_scale, g_ws.lsf_grad_alpha_buf,
+        g_cfg.B, g_cfg.T, C, 0.0f, stream
+    );
+    cudaStreamSynchronize(stream);
+    
+    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    
+    torch::Tensor d_moe_out = torch::empty({M, C}, opts_bf16);
+    cudaMemcpy(d_moe_out.data_ptr(), g_ws.d_layer_moe_out, (size_t)M * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    
+    torch::Tensor d_var_scale = torch::empty({1}, opts_f32);
+    cudaMemcpy(d_var_scale.data_ptr(), lay.d_var_scale, sizeof(float), cudaMemcpyDeviceToDevice);
+    
+    return {d_moe_out, d_var_scale};
+}
+
+void set_optimizer_step(int step) {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    g_ws.step_count = step;
+}
+
+int get_optimizer_step() {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    return g_ws.step_count;
 }
 
 // Component 4: Isolated MoE Forward Test Binding
@@ -769,5 +921,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_all_layer_gradients", &get_all_layer_gradients, "Component 4: Get all layer parameter gradients including MoE");
     m.def("test_moe_forward", &test_moe_forward, "Component 4: Test native MoE forward");
     m.def("test_moe_backward", &test_moe_backward, "Component 4: Test native MoE backward");
+    m.def("get_global_gradients", &get_global_gradients, "Component 5: Get token emb, final norm, and LM head gradients");
+    m.def("get_layer_scalar_gradients", &get_layer_scalar_gradients, "Component 5: Get layer scalar gradients (d_gamma_raw, d_var_scale)");
+    m.def("test_lsf_forward", &test_lsf_forward, "Component 5: Test native Liquid State Fusion forward");
+    m.def("test_lsf_backward", &test_lsf_backward, "Component 5: Test native Liquid State Fusion backward");
+    m.def("set_optimizer_step", &set_optimizer_step, "Component 5: Set optimizer step counter");
+    m.def("get_optimizer_step", &get_optimizer_step, "Component 5: Get optimizer step counter");
+    m.def("forward_step", &forward_step, "Component 5: Run full model forward step");
+    m.def("backward_step", &backward_step, "Component 5: Run full model backward step");
+    m.def("optimizer_step", &optimizer_step, "Component 5: Run full model optimizer step");
+    m.def("get_logits", &get_logits, "Component 5: Retrieve forward logits");
 }
 

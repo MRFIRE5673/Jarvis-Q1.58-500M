@@ -3,6 +3,7 @@
 #include "cublaslt_engine.h"
 #include "attention.h"
 #include "moe.h"
+#include "liquid_state_fusion.h"
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -179,18 +180,27 @@ void run_full_model_forward(
             );
         }
         
-        // Step 2h+2i: Fused MoE Scatter Combine + Residual 2 Addition (Direct next-layer stashing!)
+        // Step 2h: MoE Scatter Combine into ws.layer_moe_out
+        launch_moe_scatter_combine(
+            ws.layer_dispatched_y, ws.layer_topk_gates, ws.layer_scatter_map,
+            ws.layer_moe_out, M, C, stream
+        );
+        
+        // Step 2i: Liquid State Fusion (Algo 1 L15 / Eq. 8)
+        launch_liquid_state_fusion_fwd(
+            ws.layer_moe_out, lay.var_scale, ws.layer_h_out, ws.layer_h_last[l], nullptr,
+            ws.lsf_alpha_buf, ws.lsf_mean_var_buf, cfg.B, cfg.T, C, stream
+        );
+        
+        // Step 2j: Residual 2 Addition (ws.layer_x1 + ws.layer_h_out)
         if (l < cfg.num_layers - 1) {
-            launch_moe_scatter_combine_add_residual(
-                ws.layer_dispatched_y, ws.layer_topk_gates, ws.layer_scatter_map,
-                ws.layer_x1, ws.stashed_x[l + 1], M, C, stream,
-                cfg.use_fp8_qkv_backward ? ws.stashed_x_fp8[l + 1] : nullptr, 16.0f
+            launch_fused_add_residual(
+                ws.layer_x1, ws.layer_h_out, ws.stashed_x[l + 1], M * C, stream
             );
             cur_x = ws.stashed_x[l + 1];
         } else {
-            launch_moe_scatter_combine_add_residual(
-                ws.layer_dispatched_y, ws.layer_topk_gates, ws.layer_scatter_map,
-                ws.layer_x1, ws.layer_x2, M, C, stream
+            launch_fused_add_residual(
+                ws.layer_x1, ws.layer_h_out, ws.layer_x2, M * C, stream
             );
             cur_x = ws.layer_x2;
         }
@@ -275,8 +285,9 @@ void run_full_model_backward(
     
     // 2. Final RMSNorm Backward: d_final_norm -> ws.d_layer_x
     launch_fused_rmsnorm_bwd(
-        ws.d_final_norm_out, ws.stashed_x[cfg.num_layers - 1], params.final_norm_weight,
-        ws.final_rsqrt, ws.d_layer_x, params.d_final_norm_weight, M, C, stream
+        ws.d_final_norm_out, ws.layer_x2, params.final_norm_weight,
+        ws.final_rsqrt, ws.d_layer_x, params.d_final_norm_weight, M, C, stream,
+        nullptr, 1.0f, beta
     );
     
     if (is_final_step) {
@@ -326,10 +337,29 @@ void run_full_model_backward(
             M * cfg.top_k, cfg.hidden_dim, C, cfg.E, stream
         );
         
-        // 2a. MoE Scatter Backward:
-        // cur_dx (dL/dx2) -> ws.d_dispatched_y, ws.d_topk_gates
+        // 1b. Recompute MoE scatter combine and LSF forward for Layer l
+        launch_moe_scatter_combine(
+            ws.layer_dispatched_y, ws.layer_topk_gates, ws.layer_scatter_map,
+            ws.layer_moe_out, M, C, stream
+        );
+        launch_liquid_state_fusion_fwd(
+            ws.layer_moe_out, lay.var_scale, ws.layer_h_out, ws.layer_h_last[l], nullptr,
+            ws.lsf_alpha_buf, ws.lsf_mean_var_buf, cfg.B, cfg.T, C, stream
+        );
+        
+        // 2a. Liquid State Fusion Backward:
+        // cur_dx (dL/dx2) -> ws.d_layer_moe_out, and accumulates lay.d_var_scale
+        launch_liquid_state_fusion_bwd(
+            cur_dx, ws.layer_moe_out, ws.layer_h_out, nullptr,
+            lay.var_scale, ws.lsf_mean_var_buf, ws.lsf_alpha_buf,
+            ws.d_layer_moe_out, lay.d_var_scale, ws.lsf_grad_alpha_buf,
+            cfg.B, cfg.T, C, beta, stream
+        );
+        
+        // 2b. MoE Scatter Backward:
+        // ws.d_layer_moe_out -> ws.d_dispatched_y, ws.d_topk_gates
         launch_moe_scatter_backward(
-            cur_dx, ws.layer_dispatched_y, ws.layer_topk_gates,
+            ws.d_layer_moe_out, ws.layer_dispatched_y, ws.layer_topk_gates,
             ws.layer_gather_map, ws.layer_gate_idx_map, ws.layer_scatter_map,
             ws.d_dispatched_y, ws.d_topk_gates,
             M, M * cfg.top_k, C, stream
@@ -382,7 +412,8 @@ void run_full_model_backward(
         // ws.dx_norm2 -> ws.dx_norm2_in, lay.d_norm2_weight
         launch_fused_rmsnorm_bwd(
             ws.dx_norm2, ws.layer_x1, lay.norm2_weight,
-            ws.layer_rsqrt2, ws.dx_norm2_in, lay.d_norm2_weight, M, C, stream
+            ws.layer_rsqrt2, ws.dx_norm2_in, lay.d_norm2_weight, M, C, stream,
+            nullptr, 1.0f, beta
         );
         
         // 2i. Residual 2 Addition:
@@ -432,7 +463,8 @@ void run_full_model_backward(
         // Propagate dx_norm1 through RMSNorm 1 -> dx_norm1_in and accumulate lay.d_norm1_weight
         launch_fused_rmsnorm_bwd(
             ws.dx_norm1, ws.stashed_x[l], lay.norm1_weight,
-            ws.layer_rsqrt1, ws.dx_norm1_in, lay.d_norm1_weight, M, C, stream
+            ws.layer_rsqrt1, ws.dx_norm1_in, lay.d_norm1_weight, M, C, stream,
+            nullptr, 1.0f, beta
         );
         
         // 6. Residual 1 Addition:
@@ -606,18 +638,27 @@ void run_interleaved_forward(
                 launch_moe_grouped_gemm_fwd_w2(ws.layer_act, lay.w2_weights, ws.layer_expert_offsets, ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, cfg.E, stream);
             }
             
-            // Step 2h+2i: Fused MoE Scatter Combine + Residual 2 Addition (Direct next-layer stashing!)
+            // Step 2h: MoE Scatter Combine into ws.layer_moe_out
+            launch_moe_scatter_combine(
+                ws.layer_dispatched_y, ws.layer_topk_gates, ws.layer_scatter_map,
+                ws.layer_moe_out, M, C, stream
+            );
+            
+            // Step 2i: Liquid State Fusion
+            launch_liquid_state_fusion_fwd(
+                ws.layer_moe_out, lay.var_scale, ws.layer_h_out, ws.layer_h_last[l], nullptr,
+                ws.lsf_alpha_buf, ws.lsf_mean_var_buf, cfg.B, cfg.T, C, stream
+            );
+            
+            // Step 2j: Residual 2 Addition
             if (l < cfg.num_layers - 1) {
-                launch_moe_scatter_combine_add_residual(
-                    ws.layer_dispatched_y, ws.layer_topk_gates, ws.layer_scatter_map,
-                    ws.layer_x1, ws.stashed_x_ms[ms][l + 1], M, C, stream,
-                    cfg.use_fp8_qkv_backward ? ws.stashed_x_fp8_ms[ms][l + 1] : nullptr, 16.0f
+                launch_fused_add_residual(
+                    ws.layer_x1, ws.layer_h_out, ws.stashed_x_ms[ms][l + 1], M * C, stream
                 );
                 cur_x[ms] = ws.stashed_x_ms[ms][l + 1];
             } else {
-                launch_moe_scatter_combine_add_residual(
-                    ws.layer_dispatched_y, ws.layer_topk_gates, ws.layer_scatter_map,
-                    ws.layer_x1, ws.layer_x2_ms[ms], M, C, stream
+                launch_fused_add_residual(
+                    ws.layer_x1, ws.layer_h_out, ws.layer_x2_ms[ms], M * C, stream
                 );
                 cur_x[ms] = ws.layer_x2_ms[ms];
             }
@@ -691,8 +732,9 @@ void run_interleaved_backward(
         }
         
         launch_fused_rmsnorm_bwd(
-            ws.d_final_norm_out_ms[ms], ws.stashed_x_ms[ms][cfg.num_layers - 1], params.final_norm_weight,
-            ws.final_rsqrt_ms[ms], ws.d_layer_x_ms[ms], params.d_final_norm_weight, M, C, stream
+            ws.d_final_norm_out_ms[ms], ws.layer_x2_ms[ms], params.final_norm_weight,
+            ws.final_rsqrt_ms[ms], ws.d_layer_x_ms[ms], params.d_final_norm_weight, M, C, stream,
+            nullptr, 1.0f, beta
         );
     }
     
@@ -746,10 +788,27 @@ void run_interleaved_backward(
                 M * cfg.top_k, cfg.hidden_dim, C, cfg.E, stream
             );
             
-            // 2a. MoE Scatter Backward:
-            // cur_dx[ms] (dL/dx2) -> ws.d_dispatched_y, ws.d_topk_gates
+            // 1b. Recompute MoE scatter combine and LSF forward for Layer l, microstep ms
+            launch_moe_scatter_combine(
+                ws.layer_dispatched_y, ws.layer_topk_gates, ws.layer_scatter_map,
+                ws.layer_moe_out, M, C, stream
+            );
+            launch_liquid_state_fusion_fwd(
+                ws.layer_moe_out, lay.var_scale, ws.layer_h_out, ws.layer_h_last[l], nullptr,
+                ws.lsf_alpha_buf, ws.lsf_mean_var_buf, cfg.B, cfg.T, C, stream
+            );
+            
+            // 2a. Liquid State Fusion Backward:
+            launch_liquid_state_fusion_bwd(
+                cur_dx[ms], ws.layer_moe_out, ws.layer_h_out, nullptr,
+                lay.var_scale, ws.lsf_mean_var_buf, ws.lsf_alpha_buf,
+                ws.d_layer_moe_out, lay.d_var_scale, ws.lsf_grad_alpha_buf,
+                cfg.B, cfg.T, C, beta_layer, stream
+            );
+            
+            // 2b. MoE Scatter Backward:
             launch_moe_scatter_backward(
-                cur_dx[ms], ws.layer_dispatched_y, ws.layer_topk_gates,
+                ws.d_layer_moe_out, ws.layer_dispatched_y, ws.layer_topk_gates,
                 ws.layer_gather_map, ws.layer_gate_idx_map, ws.layer_scatter_map,
                 ws.d_dispatched_y, ws.d_topk_gates,
                 M, M * cfg.top_k, C, stream

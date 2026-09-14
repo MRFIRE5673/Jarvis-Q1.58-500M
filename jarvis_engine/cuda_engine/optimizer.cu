@@ -145,24 +145,57 @@ __global__ void accumulate_multi_grad_norm_sq_kernel(
     }
 }
 
+__global__ void accumulate_layer_scalar_grad_norm_sq_kernel(
+    const float* __restrict__ d_gamma,
+    const float* __restrict__ d_var,
+    int H,
+    float* __restrict__ grad_norm_sq
+) {
+    int tid = threadIdx.x;
+    float sum_sq = 0.0f;
+    if (tid < H) {
+        float g = d_gamma[tid];
+        sum_sq += g * g;
+    }
+    if (tid == 0) {
+        float v = *d_var;
+        sum_sq += v * v;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+    if (tid == 0 && sum_sq > 0.0f) {
+        atomicAdd(grad_norm_sq, sum_sq);
+    }
+}
+
 void launch_accumulate_layer_grad_norm_sq(
     const LayerWeights& lay,
     float* grad_norm_sq,
     const FullJarvisConfig& cfg,
     cudaStream_t stream
 ) {
-    // EXP-27-009: Only d_norm1_weight and d_qkv_weight receive actual BPTT gradients.
-    // d_out_proj_weight, d_norm2_weight, d_router_weight, d_w1_weights, d_w2_weights
-    // are ternary/frozen weights whose gradient buffers are always zero — including
-    // them wastes ~408M element reads + atomicAdds per training step with zero benefit.
     MultiGradRefs refs;
     refs.ptrs[0] = lay.d_norm1_weight; refs.sizes[0] = cfg.C;
     refs.ptrs[1] = lay.d_qkv_weight;   refs.sizes[1] = 3 * cfg.C * cfg.C;
-    refs.num_refs = 2;
+    refs.ptrs[2] = lay.d_out_proj_weight; refs.sizes[2] = cfg.C * cfg.C;
+    refs.ptrs[3] = lay.d_norm2_weight; refs.sizes[3] = cfg.C;
+    refs.ptrs[4] = lay.d_router_weight; refs.sizes[4] = cfg.E * cfg.C;
+    refs.ptrs[5] = lay.d_w1_weights[0]; refs.sizes[5] = cfg.hidden_dim * cfg.C;
+    refs.ptrs[6] = lay.d_w1_weights[1]; refs.sizes[6] = cfg.hidden_dim * cfg.C;
+    refs.ptrs[7] = lay.d_w1_weights[2]; refs.sizes[7] = cfg.hidden_dim * cfg.C;
+    refs.ptrs[8] = lay.d_w1_weights[3]; refs.sizes[8] = cfg.hidden_dim * cfg.C;
+    refs.ptrs[9] = lay.d_w2_weights[0]; refs.sizes[9] = cfg.C * cfg.hidden_dim;
+    refs.ptrs[10] = lay.d_w2_weights[1]; refs.sizes[10] = cfg.C * cfg.hidden_dim;
+    refs.ptrs[11] = lay.d_w2_weights[2]; refs.sizes[11] = cfg.C * cfg.hidden_dim;
+    refs.ptrs[12] = lay.d_w2_weights[3]; refs.sizes[12] = cfg.C * cfg.hidden_dim;
+    refs.num_refs = 13;
     
     const int BLOCK = 256;
     const int GRID = 256;
     accumulate_multi_grad_norm_sq_kernel<BLOCK><<<GRID, BLOCK, 0, stream>>>(refs, grad_norm_sq);
+    accumulate_layer_scalar_grad_norm_sq_kernel<<<1, 32, 0, stream>>>(lay.d_gamma_raw, lay.d_var_scale, cfg.H, grad_norm_sq);
 }
 
 void launch_accumulate_global_grad_norm_sq(
@@ -231,10 +264,16 @@ __global__ void fused_adamw_update_bf16_vec8_kernel(
     float beta2,
     float eps,
     float weight_decay,
-    int N
+    int N,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     float clip_coef = *clip_coef_ptr;
+    if (step_size == 0.0f) {
+        step_size = lr;
+        eps_corrected = eps;
+    }
     
     if (idx + 7 < N) {
         uint4* p_u4 = reinterpret_cast<uint4*>(param + idx);
@@ -273,7 +312,7 @@ __global__ void fused_adamw_update_bf16_vec8_kernel(
             
             m_val = beta1 * m_val + (1.0f - beta1) * g_val;
             v_val = beta2 * v_val + (1.0f - beta2) * g_val * g_val;
-            p_val = p_val - lr * (m_val / (sqrtf(v_val) + eps) + weight_decay * p_val);
+            p_val = p_val * (1.0f - lr * weight_decay) - step_size * (m_val / (sqrtf(v_val) + eps_corrected));
             
             new_p[k] = __float2bfloat16(p_val);
             new_m[k] = m_val;
@@ -295,7 +334,7 @@ __global__ void fused_adamw_update_bf16_vec8_kernel(
             
             mi = beta1 * mi + (1.0f - beta1) * g;
             vi = beta2 * vi + (1.0f - beta2) * g * g;
-            p = p - lr * (mi / (sqrtf(vi) + eps) + weight_decay * p);
+            p = p * (1.0f - lr * weight_decay) - step_size * (mi / (sqrtf(vi) + eps_corrected));
             
             param[i] = __float2bfloat16(p);
             m[i] = mi;
@@ -316,12 +355,15 @@ void launch_fused_adamw_update_bf16(
     float eps,
     float weight_decay,
     int num_elements,
-    cudaStream_t stream
+    cudaStream_t stream,
+    float step_size,
+    float eps_corrected
 ) {
     const int BLOCK = 256;
     int grid = ((num_elements + 7) / 8 + BLOCK - 1) / BLOCK;
     fused_adamw_update_bf16_vec8_kernel<<<grid, BLOCK, 0, stream>>>(
-        param, grad, m, v, clip_coef, lr, beta1, beta2, eps, weight_decay, num_elements
+        param, grad, m, v, clip_coef, lr, beta1, beta2, eps, weight_decay, num_elements,
+        step_size, eps_corrected
     );
 }
 
@@ -341,10 +383,16 @@ __global__ void fused_adamw_update_bf16_moments_vec8_kernel(
     float weight_decay,
     int N,
     __nv_fp8_e4m3* __restrict__ param_fp8 = nullptr,
-    float scale_fp8 = 64.0f
+    float scale_fp8 = 64.0f,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     float clip_coef = *clip_coef_ptr;
+    if (step_size == 0.0f) {
+        step_size = lr;
+        eps_corrected = eps;
+    }
     
     if (idx + 7 < N) {
         uint4* p_u4 = reinterpret_cast<uint4*>(param + idx);
@@ -375,7 +423,7 @@ __global__ void fused_adamw_update_bf16_moments_vec8_kernel(
             
             m_val = beta1 * m_val + (1.0f - beta1) * g_val;
             v_val = beta2 * v_val + (1.0f - beta2) * g_val * g_val;
-            p_val = p_val - lr * (m_val / (sqrtf(v_val) + eps) + weight_decay * p_val);
+            p_val = p_val * (1.0f - lr * weight_decay) - step_size * (m_val / (sqrtf(v_val) + eps_corrected));
             
             new_p[k] = __float2bfloat16(p_val);
             new_m[k] = __float2bfloat16(m_val);
@@ -403,7 +451,7 @@ __global__ void fused_adamw_update_bf16_moments_vec8_kernel(
             
             mi = beta1 * mi + (1.0f - beta1) * g;
             vi = beta2 * vi + (1.0f - beta2) * g * g;
-            p = p - lr * (mi / (sqrtf(vi) + eps) + weight_decay * p);
+            p = p * (1.0f - lr * weight_decay) - step_size * (mi / (sqrtf(vi) + eps_corrected));
             
             param[i] = __float2bfloat16(p);
             m[i] = __float2bfloat16(mi);
@@ -429,13 +477,15 @@ void launch_fused_adamw_update_bf16_moments(
     int num_elements,
     cudaStream_t stream,
     __nv_fp8_e4m3* param_fp8,
-    float scale_fp8
+    float scale_fp8,
+    float step_size,
+    float eps_corrected
 ) {
     const int BLOCK = 256;
     int grid = ((num_elements + 7) / 8 + BLOCK - 1) / BLOCK;
     fused_adamw_update_bf16_moments_vec8_kernel<<<grid, BLOCK, 0, stream>>>(
         param, grad, m, v, clip_coef, lr, beta1, beta2, eps, weight_decay, num_elements,
-        param_fp8, scale_fp8
+        param_fp8, scale_fp8, step_size, eps_corrected
     );
 }
 
@@ -459,10 +509,16 @@ __global__ void fused_adamw_update_fp8_moments_vec8_kernel(
     float scale_m = 256.0f,
     float inv_scale_m = 1.0f / 256.0f,
     float scale_s = 512.0f,
-    float inv_scale_s = 1.0f / 512.0f
+    float inv_scale_s = 1.0f / 512.0f,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     float clip_coef = *clip_coef_ptr;
+    if (step_size == 0.0f) {
+        step_size = lr;
+        eps_corrected = eps;
+    }
     
     if (idx + 7 < N) {
         uint4* p_u4 = reinterpret_cast<uint4*>(param + idx);
@@ -495,7 +551,7 @@ __global__ void fused_adamw_update_fp8_moments_vec8_kernel(
             m_val = beta1 * m_val + (1.0f - beta1) * g_val;
             float v_val = beta2 * v_prev + (1.0f - beta2) * g_val * g_val;
             float s_val_new = sqrtf(v_val);
-            p_val = p_val - lr * (m_val / (s_val_new + eps) + weight_decay * p_val);
+            p_val = p_val * (1.0f - lr * weight_decay) - step_size * (m_val / (s_val_new + eps_corrected));
             
             new_p[k] = __float2bfloat16(p_val);
             new_m[k] = __nv_fp8_e4m3(m_val * scale_m);
@@ -525,7 +581,7 @@ __global__ void fused_adamw_update_fp8_moments_vec8_kernel(
             m_val = beta1 * m_val + (1.0f - beta1) * g_val;
             float v_val = beta2 * v_prev + (1.0f - beta2) * g_val * g_val;
             float s_val_new = sqrtf(v_val);
-            p_val = p_val - lr * (m_val / (s_val_new + eps) + weight_decay * p_val);
+            p_val = p_val * (1.0f - lr * weight_decay) - step_size * (m_val / (s_val_new + eps_corrected));
             
             param[i] = __float2bfloat16(p_val);
             m_fp8[i] = __nv_fp8_e4m3(m_val * scale_m);
@@ -553,13 +609,16 @@ void launch_fused_adamw_update_fp8_moments(
     __nv_fp8_e4m3* param_fp8,
     float scale_fp8,
     float scale_m,
-    float scale_v
+    float scale_v,
+    float step_size,
+    float eps_corrected
 ) {
     const int BLOCK = 256;
     int grid = ((num_elements + 7) / 8 + BLOCK - 1) / BLOCK;
     fused_adamw_update_fp8_moments_vec8_kernel<<<grid, BLOCK, 0, stream>>>(
         param, grad, m, v, clip_coef, lr, beta1, beta2, eps, weight_decay, num_elements,
-        param_fp8, scale_fp8, scale_m, 1.0f / scale_m, scale_v, 1.0f / scale_v
+        param_fp8, scale_fp8, scale_m, 1.0f / scale_m, scale_v, 1.0f / scale_v,
+        step_size, eps_corrected
     );
 }
 
@@ -574,10 +633,16 @@ __global__ void fused_adamw_update_f32_kernel(
     float beta2,
     float eps,
     float weight_decay,
-    int N
+    int N,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
+    if (step_size == 0.0f) {
+        step_size = lr;
+        eps_corrected = eps;
+    }
     
     float clip_coef = *clip_coef_ptr;
     float g = grad[idx] * clip_coef;
@@ -587,7 +652,7 @@ __global__ void fused_adamw_update_f32_kernel(
     
     mi = beta1 * mi + (1.0f - beta1) * g;
     vi = beta2 * vi + (1.0f - beta2) * g * g;
-    p = p - lr * (mi / (sqrtf(vi) + eps) + weight_decay * p);
+    p = p * (1.0f - lr * weight_decay) - step_size * (mi / (sqrtf(vi) + eps_corrected));
     
     param[idx] = p;
     m[idx] = mi;
@@ -607,12 +672,15 @@ void launch_fused_adamw_update_f32(
     float eps,
     float weight_decay,
     int num_elements,
-    cudaStream_t stream
+    cudaStream_t stream,
+    float step_size,
+    float eps_corrected
 ) {
     const int BLOCK = 256;
     int grid = (num_elements + BLOCK - 1) / BLOCK;
     fused_adamw_update_f32_kernel<<<grid, BLOCK, 0, stream>>>(
-        param, grad, m, v, clip_coef, lr, beta1, beta2, eps, weight_decay, num_elements
+        param, grad, m, v, clip_coef, lr, beta1, beta2, eps, weight_decay, num_elements,
+        step_size, eps_corrected
     );
 }
 
@@ -689,8 +757,14 @@ __device__ __forceinline__ void update_bf16_vec8(
     float beta1,
     float beta2,
     float eps,
-    float weight_decay
+    float weight_decay,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
+    if (step_size == 0.0f) {
+        step_size = lr;
+        eps_corrected = eps;
+    }
     uint4* p_u4 = reinterpret_cast<uint4*>(param + idx);
     uint4* g_u4 = reinterpret_cast<uint4*>(grad + idx);
     float4* m_f4_0 = reinterpret_cast<float4*>(m + idx);
@@ -727,7 +801,7 @@ __device__ __forceinline__ void update_bf16_vec8(
         
         m_val = beta1 * m_val + (1.0f - beta1) * g_val;
         v_val = beta2 * v_val + (1.0f - beta2) * g_val * g_val;
-        p_val = p_val - lr * (m_val / (sqrtf(v_val) + eps) + weight_decay * p_val);
+        p_val = p_val * (1.0f - lr * weight_decay) - step_size * (m_val / (sqrtf(v_val) + eps_corrected));
         
         new_p[k] = __float2bfloat16(p_val);
         new_m[k] = m_val;
@@ -751,7 +825,9 @@ __global__ void fused_adamw_all_moe_experts_vec8_kernel(
     float beta1,
     float beta2,
     float eps,
-    float weight_decay
+    float weight_decay,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     __shared__ __nv_bfloat16* s_param;
     __shared__ __nv_bfloat16* s_grad;
@@ -769,7 +845,7 @@ __global__ void fused_adamw_all_moe_experts_vec8_kernel(
     
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     float clip_coef = *clip_coef_ptr;
-    update_bf16_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+    update_bf16_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected);
 }
 
 // ---------------------------------------------------------------------------
@@ -782,7 +858,9 @@ __global__ void fused_adamw_all_qkv_vec8_kernel(
     float beta1,
     float beta2,
     float eps,
-    float weight_decay
+    float weight_decay,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     __shared__ __nv_bfloat16* s_param;
     __shared__ __nv_bfloat16* s_grad;
@@ -800,7 +878,7 @@ __global__ void fused_adamw_all_qkv_vec8_kernel(
     
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     float clip_coef = *clip_coef_ptr;
-    update_bf16_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+    update_bf16_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected);
 }
 
 // ---------------------------------------------------------------------------
@@ -813,7 +891,9 @@ __global__ void fused_adamw_all_out_proj_vec8_kernel(
     float beta1,
     float beta2,
     float eps,
-    float weight_decay
+    float weight_decay,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     __shared__ __nv_bfloat16* s_param;
     __shared__ __nv_bfloat16* s_grad;
@@ -831,7 +911,7 @@ __global__ void fused_adamw_all_out_proj_vec8_kernel(
     
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     float clip_coef = *clip_coef_ptr;
-    update_bf16_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+    update_bf16_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected);
 }
 
 // ---------------------------------------------------------------------------
@@ -847,26 +927,32 @@ __global__ void fused_adamw_all_small_params_kernel(
     float weight_decay,
     int C,
     int E,
-    int H
+    int H,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     int block_id = blockIdx.x; // 0..23: layers 0..23, 24: final_norm
     int tid = threadIdx.x;
     float clip_coef = *clip_coef_ptr;
+    if (step_size == 0.0f) {
+        step_size = lr;
+        eps_corrected = eps;
+    }
     
     if (block_id < 24) {
         int l = block_id;
         // 1. norm1 (C elements)
         for (int idx = tid * 8; idx < C; idx += blockDim.x * 8) {
-            update_bf16_vec8(sp->norm1[l], sp->d_norm1[l], sp->m_norm1[l], sp->v_norm1[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+            update_bf16_vec8(sp->norm1[l], sp->d_norm1[l], sp->m_norm1[l], sp->v_norm1[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected);
         }
         // 2. norm2 (C elements)
         for (int idx = tid * 8; idx < C; idx += blockDim.x * 8) {
-            update_bf16_vec8(sp->norm2[l], sp->d_norm2[l], sp->m_norm2[l], sp->v_norm2[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+            update_bf16_vec8(sp->norm2[l], sp->d_norm2[l], sp->m_norm2[l], sp->v_norm2[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected);
         }
         // 3. router (E * C elements)
         int EC = E * C;
         for (int idx = tid * 8; idx < EC; idx += blockDim.x * 8) {
-            update_bf16_vec8(sp->router[l], sp->d_router[l], sp->m_router[l], sp->v_router[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+            update_bf16_vec8(sp->router[l], sp->d_router[l], sp->m_router[l], sp->v_router[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected);
         }
         // 4. gamma (H elements)
         if (tid < H) {
@@ -876,7 +962,7 @@ __global__ void fused_adamw_all_small_params_kernel(
             float vi = sp->v_gamma[l][tid];
             mi = beta1 * mi + (1.0f - beta1) * g;
             vi = beta2 * vi + (1.0f - beta2) * g * g;
-            param = param - lr * (mi / (sqrtf(vi) + eps));
+            param = param - step_size * (mi / (sqrtf(vi) + eps_corrected));
             sp->gamma[l][tid] = param;
             sp->m_gamma[l][tid] = mi;
             sp->v_gamma[l][tid] = vi;
@@ -890,7 +976,7 @@ __global__ void fused_adamw_all_small_params_kernel(
             float vi = sp->v_var[l][0];
             mi = beta1 * mi + (1.0f - beta1) * g;
             vi = beta2 * vi + (1.0f - beta2) * g * g;
-            param = param - lr * (mi / (sqrtf(vi) + eps));
+            param = param - step_size * (mi / (sqrtf(vi) + eps_corrected));
             sp->var[l][0] = param;
             sp->m_var[l][0] = mi;
             sp->v_var[l][0] = vi;
@@ -899,7 +985,7 @@ __global__ void fused_adamw_all_small_params_kernel(
     } else if (block_id == 24) {
         // Block 24: final_norm (C elements)
         for (int idx = tid * 8; idx < C; idx += blockDim.x * 8) {
-            update_bf16_vec8(sp->final_norm, sp->d_final_norm, sp->m_final_norm, sp->v_final_norm, idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+            update_bf16_vec8(sp->final_norm, sp->d_final_norm, sp->m_final_norm, sp->v_final_norm, idx, clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected);
         }
     }
 }
@@ -975,8 +1061,14 @@ __device__ __forceinline__ void update_bf16_moments_vec8(
     float eps,
     float weight_decay,
     __nv_fp8_e4m3* param_fp8 = nullptr,
-    float scale_fp8 = 64.0f
+    float scale_fp8 = 64.0f,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
+    if (step_size == 0.0f) {
+        step_size = lr;
+        eps_corrected = eps;
+    }
     uint4* p_u4 = reinterpret_cast<uint4*>(param + idx);
     const uint4* g_u4 = reinterpret_cast<const uint4*>(grad + idx);
     uint4* m_u4 = reinterpret_cast<uint4*>(m + idx);
@@ -1005,7 +1097,7 @@ __device__ __forceinline__ void update_bf16_moments_vec8(
         
         m_val = beta1 * m_val + (1.0f - beta1) * g_val;
         v_val = beta2 * v_val + (1.0f - beta2) * g_val * g_val;
-        p_val = p_val - lr * (m_val / (sqrtf(v_val) + eps) + weight_decay * p_val);
+        p_val = p_val * (1.0f - lr * weight_decay) - step_size * (m_val / (sqrtf(v_val) + eps_corrected));
         
         new_p[k] = __float2bfloat16(p_val);
         new_m[k] = __float2bfloat16(m_val);
@@ -1032,7 +1124,9 @@ __global__ void fused_adamw_all_moe_experts_bf16_moments_vec8_kernel(
     float beta1,
     float beta2,
     float eps,
-    float weight_decay
+    float weight_decay,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     __shared__ __nv_bfloat16* s_param;
     __shared__ __nv_bfloat16* s_grad;
@@ -1050,7 +1144,7 @@ __global__ void fused_adamw_all_moe_experts_bf16_moments_vec8_kernel(
     
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     float clip_coef = *clip_coef_ptr;
-    update_bf16_moments_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+    update_bf16_moments_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay, nullptr, 64.0f, step_size, eps_corrected);
 }
 
 __global__ void fused_adamw_all_qkv_bf16_moments_vec8_kernel(
@@ -1060,7 +1154,9 @@ __global__ void fused_adamw_all_qkv_bf16_moments_vec8_kernel(
     float beta1,
     float beta2,
     float eps,
-    float weight_decay
+    float weight_decay,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     __shared__ __nv_bfloat16* s_param;
     __shared__ __nv_bfloat16* s_grad;
@@ -1080,7 +1176,7 @@ __global__ void fused_adamw_all_qkv_bf16_moments_vec8_kernel(
     
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     float clip_coef = *clip_coef_ptr;
-    update_bf16_moments_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay, s_param_fp8, 64.0f);
+    update_bf16_moments_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay, s_param_fp8, 64.0f, step_size, eps_corrected);
 }
 
 __global__ void fused_adamw_all_out_proj_bf16_moments_vec8_kernel(
@@ -1090,7 +1186,9 @@ __global__ void fused_adamw_all_out_proj_bf16_moments_vec8_kernel(
     float beta1,
     float beta2,
     float eps,
-    float weight_decay
+    float weight_decay,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     __shared__ __nv_bfloat16* s_param;
     __shared__ __nv_bfloat16* s_grad;
@@ -1108,7 +1206,7 @@ __global__ void fused_adamw_all_out_proj_bf16_moments_vec8_kernel(
     
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     float clip_coef = *clip_coef_ptr;
-    update_bf16_moments_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+    update_bf16_moments_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay, nullptr, 64.0f, step_size, eps_corrected);
 }
 
 __global__ void fused_adamw_all_small_params_bf16_moments_kernel(
@@ -1121,23 +1219,29 @@ __global__ void fused_adamw_all_small_params_bf16_moments_kernel(
     float weight_decay,
     int C,
     int E,
-    int H
+    int H,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     int block_id = blockIdx.x;
     int tid = threadIdx.x;
     float clip_coef = *clip_coef_ptr;
+    if (step_size == 0.0f) {
+        step_size = lr;
+        eps_corrected = eps;
+    }
     
     if (block_id < 24) {
         int l = block_id;
         for (int idx = tid * 8; idx < C; idx += blockDim.x * 8) {
-            update_bf16_moments_vec8(sp->norm1[l], sp->d_norm1[l], sp->m_norm1[l], sp->v_norm1[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+            update_bf16_moments_vec8(sp->norm1[l], sp->d_norm1[l], sp->m_norm1[l], sp->v_norm1[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay, nullptr, 64.0f, step_size, eps_corrected);
         }
         for (int idx = tid * 8; idx < C; idx += blockDim.x * 8) {
-            update_bf16_moments_vec8(sp->norm2[l], sp->d_norm2[l], sp->m_norm2[l], sp->v_norm2[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+            update_bf16_moments_vec8(sp->norm2[l], sp->d_norm2[l], sp->m_norm2[l], sp->v_norm2[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay, nullptr, 64.0f, step_size, eps_corrected);
         }
         int EC = E * C;
         for (int idx = tid * 8; idx < EC; idx += blockDim.x * 8) {
-            update_bf16_moments_vec8(sp->router[l], sp->d_router[l], sp->m_router[l], sp->v_router[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+            update_bf16_moments_vec8(sp->router[l], sp->d_router[l], sp->m_router[l], sp->v_router[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay, nullptr, 64.0f, step_size, eps_corrected);
         }
         if (tid < H) {
             float g = sp->d_gamma[l][tid] * clip_coef;
@@ -1146,7 +1250,7 @@ __global__ void fused_adamw_all_small_params_bf16_moments_kernel(
             float vi = sp->v_gamma[l][tid];
             mi = beta1 * mi + (1.0f - beta1) * g;
             vi = beta2 * vi + (1.0f - beta2) * g * g;
-            param = param - lr * (mi / (sqrtf(vi) + eps));
+            param = param - step_size * (mi / (sqrtf(vi) + eps_corrected));
             sp->gamma[l][tid] = param;
             sp->m_gamma[l][tid] = mi;
             sp->v_gamma[l][tid] = vi;
@@ -1159,7 +1263,7 @@ __global__ void fused_adamw_all_small_params_bf16_moments_kernel(
             float vi = sp->v_var[l][0];
             mi = beta1 * mi + (1.0f - beta1) * g;
             vi = beta2 * vi + (1.0f - beta2) * g * g;
-            param = param - lr * (mi / (sqrtf(vi) + eps));
+            param = param - step_size * (mi / (sqrtf(vi) + eps_corrected));
             sp->var[l][0] = param;
             sp->m_var[l][0] = mi;
             sp->v_var[l][0] = vi;
@@ -1167,7 +1271,7 @@ __global__ void fused_adamw_all_small_params_bf16_moments_kernel(
         }
     } else if (block_id == 24) {
         for (int idx = tid * 8; idx < C; idx += blockDim.x * 8) {
-            update_bf16_moments_vec8(sp->final_norm, sp->d_final_norm, sp->m_final_norm, sp->v_final_norm, idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+            update_bf16_moments_vec8(sp->final_norm, sp->d_final_norm, sp->m_final_norm, sp->v_final_norm, idx, clip_coef, lr, beta1, beta2, eps, weight_decay, nullptr, 64.0f, step_size, eps_corrected);
         }
     }
 }
@@ -1246,8 +1350,14 @@ __device__ __forceinline__ void update_fp8_moments_vec8(
     float scale_m = 256.0f,
     float inv_scale_m = 1.0f / 256.0f,
     float scale_s = 512.0f,
-    float inv_scale_s = 1.0f / 512.0f
+    float inv_scale_s = 1.0f / 512.0f,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
+    if (step_size == 0.0f) {
+        step_size = lr;
+        eps_corrected = eps;
+    }
     uint4* p_u4 = reinterpret_cast<uint4*>(param + idx);
     const uint4* g_u4 = reinterpret_cast<const uint4*>(grad + idx);
     uint2* m_u2 = reinterpret_cast<uint2*>(m + idx);
@@ -1278,7 +1388,7 @@ __device__ __forceinline__ void update_fp8_moments_vec8(
         m_val = beta1 * m_val + (1.0f - beta1) * g_val;
         float v_val = beta2 * v_prev + (1.0f - beta2) * g_val * g_val;
         float s_val_new = sqrtf(v_val);
-        p_val = p_val - lr * (m_val / (s_val_new + eps) + weight_decay * p_val);
+        p_val = p_val * (1.0f - lr * weight_decay) - step_size * (m_val / (s_val_new + eps_corrected));
         
         new_p[k] = __float2bfloat16(p_val);
         new_m[k] = __nv_fp8_e4m3(m_val * scale_m);
@@ -1305,7 +1415,9 @@ __global__ void fused_adamw_all_moe_experts_fp8_moments_vec8_kernel(
     float beta1,
     float beta2,
     float eps,
-    float weight_decay
+    float weight_decay,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     __shared__ __nv_bfloat16* s_param;
     __shared__ __nv_bfloat16* s_grad;
@@ -1323,7 +1435,7 @@ __global__ void fused_adamw_all_moe_experts_fp8_moments_vec8_kernel(
     
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     float clip_coef = *clip_coef_ptr;
-    update_fp8_moments_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+    update_fp8_moments_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay, nullptr, 64.0f, 256.0f, 1.0f / 256.0f, 512.0f, 1.0f / 512.0f, step_size, eps_corrected);
 }
 
 __global__ void fused_adamw_all_qkv_fp8_moments_vec8_kernel(
@@ -1333,7 +1445,9 @@ __global__ void fused_adamw_all_qkv_fp8_moments_vec8_kernel(
     float beta1,
     float beta2,
     float eps,
-    float weight_decay
+    float weight_decay,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     __shared__ __nv_bfloat16* s_param;
     __shared__ __nv_bfloat16* s_grad;
@@ -1353,7 +1467,7 @@ __global__ void fused_adamw_all_qkv_fp8_moments_vec8_kernel(
     
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     float clip_coef = *clip_coef_ptr;
-    update_fp8_moments_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay, s_param_fp8, 64.0f);
+    update_fp8_moments_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay, s_param_fp8, 64.0f, 256.0f, 1.0f / 256.0f, 512.0f, 1.0f / 512.0f, step_size, eps_corrected);
 }
 
 __global__ void fused_adamw_all_out_proj_fp8_moments_vec8_kernel(
@@ -1363,7 +1477,9 @@ __global__ void fused_adamw_all_out_proj_fp8_moments_vec8_kernel(
     float beta1,
     float beta2,
     float eps,
-    float weight_decay
+    float weight_decay,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     __shared__ __nv_bfloat16* s_param;
     __shared__ __nv_bfloat16* s_grad;
@@ -1381,7 +1497,7 @@ __global__ void fused_adamw_all_out_proj_fp8_moments_vec8_kernel(
     
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     float clip_coef = *clip_coef_ptr;
-    update_fp8_moments_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+    update_fp8_moments_vec8(s_param, s_grad, s_m, s_v, idx, clip_coef, lr, beta1, beta2, eps, weight_decay, nullptr, 64.0f, 256.0f, 1.0f / 256.0f, 512.0f, 1.0f / 512.0f, step_size, eps_corrected);
 }
 
 __global__ void fused_adamw_all_small_params_fp8_moments_kernel(
@@ -1394,23 +1510,29 @@ __global__ void fused_adamw_all_small_params_fp8_moments_kernel(
     float weight_decay,
     int C,
     int E,
-    int H
+    int H,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 ) {
     int block_id = blockIdx.x;
     int tid = threadIdx.x;
     float clip_coef = *clip_coef_ptr;
+    if (step_size == 0.0f) {
+        step_size = lr;
+        eps_corrected = eps;
+    }
     
     if (block_id < 24) {
         int l = block_id;
         for (int idx = tid * 8; idx < C; idx += blockDim.x * 8) {
-            update_fp8_moments_vec8(sp->norm1[l], sp->d_norm1[l], sp->m_norm1[l], sp->v_norm1[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+            update_fp8_moments_vec8(sp->norm1[l], sp->d_norm1[l], sp->m_norm1[l], sp->v_norm1[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay, nullptr, 64.0f, 256.0f, 1.0f / 256.0f, 512.0f, 1.0f / 512.0f, step_size, eps_corrected);
         }
         for (int idx = tid * 8; idx < C; idx += blockDim.x * 8) {
-            update_fp8_moments_vec8(sp->norm2[l], sp->d_norm2[l], sp->m_norm2[l], sp->v_norm2[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+            update_fp8_moments_vec8(sp->norm2[l], sp->d_norm2[l], sp->m_norm2[l], sp->v_norm2[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay, nullptr, 64.0f, 256.0f, 1.0f / 256.0f, 512.0f, 1.0f / 512.0f, step_size, eps_corrected);
         }
         int EC = E * C;
         for (int idx = tid * 8; idx < EC; idx += blockDim.x * 8) {
-            update_fp8_moments_vec8(sp->router[l], sp->d_router[l], sp->m_router[l], sp->v_router[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+            update_fp8_moments_vec8(sp->router[l], sp->d_router[l], sp->m_router[l], sp->v_router[l], idx, clip_coef, lr, beta1, beta2, eps, weight_decay, nullptr, 64.0f, 256.0f, 1.0f / 256.0f, 512.0f, 1.0f / 512.0f, step_size, eps_corrected);
         }
         if (tid < H) {
             float g = sp->d_gamma[l][tid] * clip_coef;
@@ -1419,7 +1541,7 @@ __global__ void fused_adamw_all_small_params_fp8_moments_kernel(
             float vi = sp->v_gamma[l][tid];
             mi = beta1 * mi + (1.0f - beta1) * g;
             vi = beta2 * vi + (1.0f - beta2) * g * g;
-            param = param - lr * (mi / (sqrtf(vi) + eps));
+            param = param - step_size * (mi / (sqrtf(vi) + eps_corrected));
             sp->gamma[l][tid] = param;
             sp->m_gamma[l][tid] = mi;
             sp->v_gamma[l][tid] = vi;
@@ -1432,7 +1554,7 @@ __global__ void fused_adamw_all_small_params_fp8_moments_kernel(
             float vi = sp->v_var[l][0];
             mi = beta1 * mi + (1.0f - beta1) * g;
             vi = beta2 * vi + (1.0f - beta2) * g * g;
-            param = param - lr * (mi / (sqrtf(vi) + eps));
+            param = param - step_size * (mi / (sqrtf(vi) + eps_corrected));
             sp->var[l][0] = param;
             sp->m_var[l][0] = mi;
             sp->v_var[l][0] = vi;
@@ -1440,7 +1562,7 @@ __global__ void fused_adamw_all_small_params_fp8_moments_kernel(
         }
     } else if (block_id == 24) {
         for (int idx = tid * 8; idx < C; idx += blockDim.x * 8) {
-            update_fp8_moments_vec8(sp->final_norm, sp->d_final_norm, sp->m_final_norm, sp->v_final_norm, idx, clip_coef, lr, beta1, beta2, eps, weight_decay);
+            update_fp8_moments_vec8(sp->final_norm, sp->d_final_norm, sp->m_final_norm, sp->v_final_norm, idx, clip_coef, lr, beta1, beta2, eps, weight_decay, nullptr, 64.0f, 256.0f, 1.0f / 256.0f, 512.0f, 1.0f / 512.0f, step_size, eps_corrected);
         }
     }
 }
@@ -1620,6 +1742,13 @@ void run_fused_optimizer_step(
     float eps = 1e-8f;
     float weight_decay = 0.01f;
     
+    ws.step_count++;
+    int step = ws.step_count;
+    float bias_correction1 = 1.0f - powf(beta1, (float)step);
+    float bias_correction2 = 1.0f - powf(beta2, (float)step);
+    float step_size = lr * sqrtf(bias_correction2) / bias_correction1;
+    float eps_corrected = eps * sqrtf(bias_correction2);
+    
     sync_optimizer_tables(params, ws, cfg, stream);
     
     const int BLOCK = 256;
@@ -1629,14 +1758,16 @@ void run_fused_optimizer_step(
         // 1. Token Embeddings (50257 * 1024) - Launch 1
         launch_fused_adamw_update_fp8_moments(
             params.tok_emb_weight, params.d_tok_emb_weight, params.m_tok_emb_fp8, params.v_tok_emb_fp8,
-            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, cfg.vocab_size * cfg.C, stream
+            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, cfg.vocab_size * cfg.C, stream,
+            nullptr, 64.0f, 256.0f, 512.0f, step_size, eps_corrected
         );
         
         // 2. LM Head (50304 * 1024) - Launch 2
         launch_fused_adamw_update_fp8_moments(
             params.lm_head_weight, params.d_lm_head_weight, params.m_lm_head_fp8, params.v_lm_head_fp8,
             ws.clip_coef, lr, beta1, beta2, eps, weight_decay, cfg.vocab_pad * cfg.C, stream,
-            (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) ? params.lm_head_weight_fp8 : nullptr, 64.0f
+            (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) ? params.lm_head_weight_fp8 : nullptr, 64.0f,
+            256.0f, 512.0f, step_size, eps_corrected
         );
         
         // 3. Consolidated All MoE Experts (192 experts = 24 layers * 8 experts) - Launch 3
@@ -1644,7 +1775,7 @@ void run_fused_optimizer_step(
         dim3 grid_moe((expert_elements / 8 + BLOCK - 1) / BLOCK, cfg.num_layers * 8); // dim3(1024, 192)
         fused_adamw_all_moe_experts_fp8_moments_vec8_kernel<<<grid_moe, BLOCK, 0, stream>>>(
             reinterpret_cast<const AllMoEExpertsFP8*>(ws.d_all_moe_experts),
-            ws.clip_coef, lr, beta1, beta2, eps, weight_decay
+            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected
         );
         
         // 4. Consolidated All QKV (24 layers * 3 * C * C) - Launch 4
@@ -1652,7 +1783,7 @@ void run_fused_optimizer_step(
         dim3 grid_qkv((qkv_elements / 8 + BLOCK - 1) / BLOCK, cfg.num_layers); // dim3(1536, 24)
         fused_adamw_all_qkv_fp8_moments_vec8_kernel<<<grid_qkv, BLOCK, 0, stream>>>(
             reinterpret_cast<const AllQKVFP8*>(ws.d_all_qkv),
-            ws.clip_coef, lr, beta1, beta2, eps, weight_decay
+            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected
         );
         
         // 5. Consolidated All Out Proj (24 layers * C * C) - Launch 5
@@ -1660,28 +1791,30 @@ void run_fused_optimizer_step(
         dim3 grid_out((out_elements / 8 + BLOCK - 1) / BLOCK, cfg.num_layers); // dim3(512, 24)
         fused_adamw_all_out_proj_fp8_moments_vec8_kernel<<<grid_out, BLOCK, 0, stream>>>(
             reinterpret_cast<const AllOutProjFP8*>(ws.d_all_out_proj),
-            ws.clip_coef, lr, beta1, beta2, eps, weight_decay
+            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected
         );
         
         // 6. Consolidated All Small Params + Final Norm (25 blocks) - Launch 6
         fused_adamw_all_small_params_fp8_moments_kernel<<<cfg.num_layers + 1, BLOCK, 0, stream>>>(
             reinterpret_cast<const AllSmallParamsFP8*>(ws.d_all_small_params),
             ws.clip_coef, lr, beta1, beta2, eps, weight_decay,
-            cfg.C, cfg.E, cfg.H
+            cfg.C, cfg.E, cfg.H, step_size, eps_corrected
         );
     } else if (cfg.use_bf16_moments) {
         // Phase 29: BF16 Moments Path (14 B/elem)
         // 1. Token Embeddings (50257 * 1024) - Launch 1
         launch_fused_adamw_update_bf16_moments(
             params.tok_emb_weight, params.d_tok_emb_weight, params.m_tok_emb_bf16, params.v_tok_emb_bf16,
-            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, cfg.vocab_size * cfg.C, stream
+            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, cfg.vocab_size * cfg.C, stream,
+            nullptr, 64.0f, step_size, eps_corrected
         );
         
         // 2. LM Head (50304 * 1024) - Launch 2
         launch_fused_adamw_update_bf16_moments(
             params.lm_head_weight, params.d_lm_head_weight, params.m_lm_head_bf16, params.v_lm_head_bf16,
             ws.clip_coef, lr, beta1, beta2, eps, weight_decay, cfg.vocab_pad * cfg.C, stream,
-            (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) ? params.lm_head_weight_fp8 : nullptr, 64.0f
+            (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) ? params.lm_head_weight_fp8 : nullptr, 64.0f,
+            step_size, eps_corrected
         );
         
         // 3. Consolidated All MoE Experts (192 experts = 24 layers * 8 experts) - Launch 3
@@ -1689,7 +1822,7 @@ void run_fused_optimizer_step(
         dim3 grid_moe((expert_elements / 8 + BLOCK - 1) / BLOCK, cfg.num_layers * 8); // dim3(1024, 192)
         fused_adamw_all_moe_experts_bf16_moments_vec8_kernel<<<grid_moe, BLOCK, 0, stream>>>(
             reinterpret_cast<const AllMoEExpertsBF16*>(ws.d_all_moe_experts),
-            ws.clip_coef, lr, beta1, beta2, eps, weight_decay
+            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected
         );
         
         // 4. Consolidated All QKV (24 layers * 3 * C * C) - Launch 4
@@ -1697,7 +1830,7 @@ void run_fused_optimizer_step(
         dim3 grid_qkv((qkv_elements / 8 + BLOCK - 1) / BLOCK, cfg.num_layers); // dim3(1536, 24)
         fused_adamw_all_qkv_bf16_moments_vec8_kernel<<<grid_qkv, BLOCK, 0, stream>>>(
             reinterpret_cast<const AllQKVBF16*>(ws.d_all_qkv),
-            ws.clip_coef, lr, beta1, beta2, eps, weight_decay
+            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected
         );
         
         // 5. Consolidated All Out Proj (24 layers * C * C) - Launch 5
@@ -1705,27 +1838,29 @@ void run_fused_optimizer_step(
         dim3 grid_out((out_elements / 8 + BLOCK - 1) / BLOCK, cfg.num_layers); // dim3(512, 24)
         fused_adamw_all_out_proj_bf16_moments_vec8_kernel<<<grid_out, BLOCK, 0, stream>>>(
             reinterpret_cast<const AllOutProjBF16*>(ws.d_all_out_proj),
-            ws.clip_coef, lr, beta1, beta2, eps, weight_decay
+            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected
         );
         
         // 6. Consolidated All Small Params + Final Norm (25 blocks) - Launch 6
         fused_adamw_all_small_params_bf16_moments_kernel<<<cfg.num_layers + 1, BLOCK, 0, stream>>>(
             reinterpret_cast<const AllSmallParamsBF16*>(ws.d_all_small_params),
             ws.clip_coef, lr, beta1, beta2, eps, weight_decay,
-            cfg.C, cfg.E, cfg.H
+            cfg.C, cfg.E, cfg.H, step_size, eps_corrected
         );
     } else {
         // Pure Reference FP32 Moments Path (22 B/elem)
         // 1. Token Embeddings (50257 * 1024) - Launch 1
         launch_fused_adamw_update_bf16(
             params.tok_emb_weight, params.d_tok_emb_weight, params.m_tok_emb, params.v_tok_emb,
-            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, cfg.vocab_size * cfg.C, stream
+            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, cfg.vocab_size * cfg.C, stream,
+            step_size, eps_corrected
         );
         
         // 2. LM Head (50304 * 1024) - Launch 2
         launch_fused_adamw_update_bf16(
             params.lm_head_weight, params.d_lm_head_weight, params.m_lm_head, params.v_lm_head,
-            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, cfg.vocab_pad * cfg.C, stream
+            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, cfg.vocab_pad * cfg.C, stream,
+            step_size, eps_corrected
         );
         
         // 3. Consolidated All MoE Experts (192 experts = 24 layers * 8 experts) - Launch 3
@@ -1733,7 +1868,7 @@ void run_fused_optimizer_step(
         dim3 grid_moe((expert_elements / 8 + BLOCK - 1) / BLOCK, cfg.num_layers * 8); // dim3(1024, 192)
         fused_adamw_all_moe_experts_vec8_kernel<<<grid_moe, BLOCK, 0, stream>>>(
             reinterpret_cast<const AllMoEExperts*>(ws.d_all_moe_experts),
-            ws.clip_coef, lr, beta1, beta2, eps, weight_decay
+            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected
         );
         
         // 4. Consolidated All QKV (24 layers * 3 * C * C) - Launch 4
@@ -1741,7 +1876,7 @@ void run_fused_optimizer_step(
         dim3 grid_qkv((qkv_elements / 8 + BLOCK - 1) / BLOCK, cfg.num_layers); // dim3(1536, 24)
         fused_adamw_all_qkv_vec8_kernel<<<grid_qkv, BLOCK, 0, stream>>>(
             reinterpret_cast<const AllQKV*>(ws.d_all_qkv),
-            ws.clip_coef, lr, beta1, beta2, eps, weight_decay
+            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected
         );
         
         // 5. Consolidated All Out Proj (24 layers * C * C) - Launch 5
@@ -1749,14 +1884,14 @@ void run_fused_optimizer_step(
         dim3 grid_out((out_elements / 8 + BLOCK - 1) / BLOCK, cfg.num_layers); // dim3(512, 24)
         fused_adamw_all_out_proj_vec8_kernel<<<grid_out, BLOCK, 0, stream>>>(
             reinterpret_cast<const AllOutProj*>(ws.d_all_out_proj),
-            ws.clip_coef, lr, beta1, beta2, eps, weight_decay
+            ws.clip_coef, lr, beta1, beta2, eps, weight_decay, step_size, eps_corrected
         );
         
         // 6. Consolidated All Small Params + Final Norm (25 blocks) - Launch 6
         fused_adamw_all_small_params_kernel<<<cfg.num_layers + 1, BLOCK, 0, stream>>>(
             reinterpret_cast<const AllSmallParams*>(ws.d_all_small_params),
             ws.clip_coef, lr, beta1, beta2, eps, weight_decay,
-            cfg.C, cfg.E, cfg.H
+            cfg.C, cfg.E, cfg.H, step_size, eps_corrected
         );
     }
 }

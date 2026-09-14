@@ -210,6 +210,13 @@ struct FullModelWorkspace {
     float*         grad_norm_sq;     // (1) Device reduction buffer for ||g||^2
     float*         clip_coef;        // (1) Device clipping coefficient buffer
     
+    // LSF & Scalar Gradient Buffers
+    float*         lsf_alpha_buf;      // (1)
+    float*         lsf_mean_var_buf;   // (2)
+    float*         lsf_grad_alpha_buf; // (64)
+    float*         d_gamma_c;          // (H = 16)
+    int            step_count;
+    
     // 6. Phase 22: Layer-Wise Interleaved Microstep Buffers (2 Microsteps)
     int32_t*       input_ids_ms[2];
     int32_t*       targets_ms[2];

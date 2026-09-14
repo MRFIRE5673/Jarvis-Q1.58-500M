@@ -48,7 +48,9 @@ void launch_fused_adamw_update_bf16(
     float eps,
     float weight_decay,
     int num_elements,
-    cudaStream_t stream
+    cudaStream_t stream,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 );
 
 void launch_fused_adamw_update_bf16_moments(
@@ -65,7 +67,9 @@ void launch_fused_adamw_update_bf16_moments(
     int num_elements,
     cudaStream_t stream,
     __nv_fp8_e4m3* param_fp8 = nullptr,
-    float scale_fp8 = 64.0f
+    float scale_fp8 = 64.0f,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 );
 
 void launch_fused_adamw_update_fp8_moments(
@@ -84,7 +88,9 @@ void launch_fused_adamw_update_fp8_moments(
     __nv_fp8_e4m3* param_fp8 = nullptr,
     float scale_fp8 = 64.0f,
     float scale_m = 256.0f,
-    float scale_v = 512.0f
+    float scale_v = 512.0f,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 );
 
 void launch_fused_adamw_update_f32(
@@ -99,7 +105,9 @@ void launch_fused_adamw_update_f32(
     float eps,
     float weight_decay,
     int num_elements,
-    cudaStream_t stream
+    cudaStream_t stream,
+    float step_size = 0.0f,
+    float eps_corrected = 0.0f
 );
 
 void run_fused_optimizer_step(

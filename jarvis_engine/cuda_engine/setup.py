@@ -87,6 +87,7 @@ setup(
                 os.path.join(current_dir, "ternary.cu"),
                 os.path.join(current_dir, "backward.cu"),
                 os.path.join(current_dir, "cublaslt_engine.cu"),
+                os.path.join(current_dir, "liquid_state_fusion.cu"),
             ],
             include_dirs=[current_dir],
             libraries=["cublasLt", "cublas"],

@@ -293,6 +293,8 @@ __global__ void unpack_d_attn_context_kernel(
 // ---------------------------------------------------------------------------
 // 8. Recurrent Chunk State Scan Backward Kernel (FP32 Accumulation)
 // ---------------------------------------------------------------------------
+// 8. Recurrent Chunk State Scan Backward Kernel (FP32 Accumulation)
+// ---------------------------------------------------------------------------
 __global__ void recurrent_chunk_state_scan_backward_kernel(
     const __nv_bfloat16* __restrict__ grad_all_states, // (B, H, Nc, D, D) = ds_all
     const __nv_bfloat16* __restrict__ grad_h_last,     // (B, H, D, D) or nullptr
@@ -300,6 +302,7 @@ __global__ void recurrent_chunk_state_scan_backward_kernel(
     const float* __restrict__ gamma_c_tab,             // (H,)
     __nv_bfloat16* __restrict__ grad_delta_S,          // (B, H, Nc, D, D) = d_delta_s
     __nv_bfloat16* __restrict__ grad_h_prev,           // (B, H, D, D) or nullptr
+    float* __restrict__ grad_gamma_c,                  // (H,) or nullptr
     int B, int H, int Nc, int D
 ) {
     int bh_idx = blockIdx.x; // [0, B * H - 1]
@@ -313,6 +316,7 @@ __global__ void recurrent_chunk_state_scan_backward_kernel(
     int tid = threadIdx.x;
     int num_threads = blockDim.x;
     
+    float thread_d_gamma = 0.0f;
     for (int elem_idx = tid; elem_idx < state_size; elem_idx += num_threads) {
         float grad_s = 0.0f;
         if (grad_h_last != nullptr) {
@@ -327,6 +331,9 @@ __global__ void recurrent_chunk_state_scan_backward_kernel(
             // grad_delta_S[k] = grad_s (since S_{k+1} = gamma_c * S_k + delta_S_k)
             grad_delta_S[offset] = __float2bfloat16(grad_s);
             
+            float s_k = __bfloat162float(all_states[offset]);
+            thread_d_gamma += grad_s * s_k;
+            
             // Backward propagation to S_k:
             // S_k contributes to S_{k+1} via (gamma_c * S_k) and to all_states[k] directly (grad_all_states[k])
             float direct_grad = __bfloat162float(grad_all_states[offset]);
@@ -337,6 +344,52 @@ __global__ void recurrent_chunk_state_scan_backward_kernel(
             int prev_offset = (b * H + h) * state_size + elem_idx;
             grad_h_prev[prev_offset] = __float2bfloat16(grad_s);
         }
+    }
+    
+    if (grad_gamma_c != nullptr) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            thread_d_gamma += __shfl_down_sync(0xffffffff, thread_d_gamma, offset);
+        }
+        __shared__ float s_gamma[32];
+        int lane = tid % 32;
+        int wid = tid / 32;
+        if (lane == 0) s_gamma[wid] = thread_d_gamma;
+        __syncthreads();
+        
+        if (wid == 0) {
+            float block_gamma = (lane < (num_threads / 32)) ? s_gamma[lane] : 0.0f;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                block_gamma += __shfl_down_sync(0xffffffff, block_gamma, offset);
+            }
+            if (lane == 0) {
+                atomicAdd(&grad_gamma_c[h], block_gamma);
+            }
+        }
+    }
+}
+
+__global__ void finalize_d_gamma_raw_kernel(
+    const float* __restrict__ grad_gamma_c,
+    const float* __restrict__ gamma_raw,
+    const float* __restrict__ gamma_c_tab,
+    float* __restrict__ d_gamma_raw,
+    int H, float beta
+) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= H) return;
+    
+    float g_raw = gamma_raw[h];
+    float sig = 1.0f / (1.0f + expf(-g_raw));
+    float gc = gamma_c_tab[h];
+    // d(gamma_c)/d(gamma_raw) = 64 * gc * (1 - sig)
+    float d_gamma = grad_gamma_c[h] * 64.0f * gc * (1.0f - sig);
+    
+    if (beta == 0.0f) {
+        d_gamma_raw[h] = d_gamma;
+    } else {
+        d_gamma_raw[h] += d_gamma;
     }
 }
 
@@ -669,11 +722,15 @@ void run_native_associative_attention_backward(
         CUBLAS_GEMM_DEFAULT
     );
     
-    // 4. Recurrent Chunk State Scan Backward (propagate dS_all -> d_delta_s)
+    // 4. Recurrent Chunk State Scan Backward (propagate dS_all -> d_delta_s and d_gamma_raw)
+    cudaMemsetAsync(ws.d_gamma_c, 0, cfg.H * sizeof(float), stream);
     recurrent_chunk_state_scan_backward_kernel<<<cfg.B * cfg.H, 256, 0, stream>>>(
         ws.attn_ds_all, nullptr, ws.attn_all_states, ws.gamma_c_tab,
-        ws.attn_d_delta_s, nullptr,
+        ws.attn_d_delta_s, nullptr, ws.d_gamma_c,
         cfg.B, cfg.H, cfg.T / cfg.chunk_size, cfg.D
+    );
+    finalize_d_gamma_raw_kernel<<<1, cfg.H, 0, stream>>>(
+        ws.d_gamma_c, lay.gamma_raw, ws.gamma_c_tab, lay.d_gamma_raw, cfg.H, beta_dw
     );
     
     // 5. Batched GEMMs: Chunk Delta S backward
