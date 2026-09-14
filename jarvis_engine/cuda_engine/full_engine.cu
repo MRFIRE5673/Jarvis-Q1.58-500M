@@ -33,7 +33,8 @@ void launch_fused_add_residual(const __nv_bfloat16* a, const __nv_bfloat16* b, _
 
 void launch_fused_cross_entropy_bwd(
     const __nv_bfloat16* logits, const int32_t* targets, __nv_bfloat16* d_logits,
-    float* loss_out, int M, int vocab_size, int vocab_pad, float loss_scale, cudaStream_t stream
+    float* loss_out, int M, int vocab_size, int vocab_pad, float loss_scale, cudaStream_t stream,
+    __nv_fp8_e4m3* d_logits_fp8 = nullptr, float scale_fp8 = 1048576.0f
 );
 
 void launch_tok_emb_fwd(
@@ -229,10 +230,12 @@ void run_full_model_forward(
         cublaslt_gemm_lm_head_fwd(ws.final_norm_out, params.lm_head_weight, ws.logits, M, C, cfg.vocab_pad, stream);
     }
     
-    // 5. Fused Cross-Entropy Loss and Analytical dLogits
+    // 5. Fused Cross-Entropy Loss and Analytical dLogits (Phase 31: writes d_logits_fp8 directly from registers)
     launch_fused_cross_entropy_bwd(
         ws.logits, ws.targets, ws.d_logits, ws.loss_buffer,
-        M, cfg.vocab_size, cfg.vocab_pad, 1.0f / (float)cfg.accum_steps, stream
+        M, cfg.vocab_size, cfg.vocab_pad, 1.0f / (float)cfg.accum_steps, stream,
+        (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) ? ws.d_logits_fp8 : nullptr,
+        1048576.0f
     );
 }
 
@@ -269,7 +272,7 @@ void run_full_model_backward(
         float scale_dlog = 1048576.0f; // 2^20
         float scale_w = 64.0f;
         float scale_fn = 16.0f;
-        launch_quantize_bf16_to_fp8(ws.d_logits, ws.d_logits_fp8, scale_dlog, M * cfg.vocab_pad, stream);
+        // Phase 31: d_logits_fp8 is populated directly from registers during CE; standalone quantization eliminated!
         if (!cfg.use_fp8_lm_head) {
             launch_quantize_bf16_to_fp8(ws.final_norm_out, ws.final_norm_out_fp8, scale_fn, M * C, stream);
         }
@@ -360,14 +363,15 @@ void run_native_training_step(
     // Fused AdamW optimizer update with in-kernel norm clipping and zero_grad
     run_fused_optimizer_step(params, ws, cfg, lr, stream);
     
-    // Phase 28: If FP8 LM Head is used (fwd or bwd), re-quantize lm_head_weight to guarantee NO stale buffers
-    if (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) {
-        launch_quantize_bf16_to_fp8(params.lm_head_weight, params.lm_head_weight_fp8, 64.0f, cfg.vocab_pad * cfg.C, stream);
-    }
-    // Phase 30: If FP8 QKV is used, re-quantize layer QKV weights to guarantee NO stale buffers
-    if (cfg.use_fp8_qkv) {
-        for (int l = 0; l < cfg.num_layers; ++l) {
-            launch_quantize_bf16_to_fp8(params.layers[l].qkv_weight, params.layers[l].qkv_weight_fp8, 64.0f, 3 * cfg.C * cfg.C, stream);
+    // Phase 31: If BF16 moments AdamW is active, FP8 weights are written directly by AdamW kernel; standalone quantize eliminated!
+    if (!cfg.use_bf16_moments) {
+        if (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) {
+            launch_quantize_bf16_to_fp8(params.lm_head_weight, params.lm_head_weight_fp8, 64.0f, cfg.vocab_pad * cfg.C, stream);
+        }
+        if (cfg.use_fp8_qkv) {
+            for (int l = 0; l < cfg.num_layers; ++l) {
+                launch_quantize_bf16_to_fp8(params.layers[l].qkv_weight, params.layers[l].qkv_weight_fp8, 64.0f, 3 * cfg.C * cfg.C, stream);
+            }
         }
     }
 }
@@ -511,9 +515,12 @@ void run_interleaved_forward(
             cublaslt_gemm_lm_head_fwd(ws.final_norm_out_ms[ms], params.lm_head_weight, ws.logits_ms[ms], M, C, cfg.vocab_pad, stream);
         }
         
+        // Phase 31: writes d_logits_fp8_ms[ms] directly from registers
         launch_fused_cross_entropy_bwd(
             ws.logits_ms[ms], ws.targets_ms[ms], ws.d_logits_ms[ms], ws.loss_buffer,
-            M, cfg.vocab_size, cfg.vocab_pad, 1.0f / (float)cfg.accum_steps, stream
+            M, cfg.vocab_size, cfg.vocab_pad, 1.0f / (float)cfg.accum_steps, stream,
+            (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) ? ws.d_logits_fp8_ms[ms] : nullptr,
+            1048576.0f
         );
     }
 }
@@ -542,7 +549,7 @@ void run_interleaved_backward(
             float scale_dlog = 1048576.0f; // 2^20
             float scale_w = 64.0f;
             float scale_fn = 16.0f;
-            launch_quantize_bf16_to_fp8(ws.d_logits_ms[ms], ws.d_logits_fp8_ms[ms], scale_dlog, M * cfg.vocab_pad, stream);
+            // Phase 31: d_logits_fp8_ms[ms] populated directly from registers during CE; standalone quantization eliminated!
             if (!cfg.use_fp8_lm_head) {
                 launch_quantize_bf16_to_fp8(ws.final_norm_out_ms[ms], ws.final_norm_out_fp8_ms[ms], scale_fn, M * C, stream);
             }
@@ -630,14 +637,15 @@ void run_native_training_step_interleaved(
     run_interleaved_backward(cfg, ws, params, stream);
     run_fused_optimizer_step(params, ws, cfg, lr, stream);
     
-    // Phase 28: If FP8 LM Head is used (fwd or bwd), re-quantize lm_head_weight to guarantee NO stale buffers
-    if (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) {
-        launch_quantize_bf16_to_fp8(params.lm_head_weight, params.lm_head_weight_fp8, 64.0f, cfg.vocab_pad * cfg.C, stream);
-    }
-    // Phase 30: If FP8 QKV is used, re-quantize layer QKV weights to guarantee NO stale buffers
-    if (cfg.use_fp8_qkv) {
-        for (int l = 0; l < cfg.num_layers; ++l) {
-            launch_quantize_bf16_to_fp8(params.layers[l].qkv_weight, params.layers[l].qkv_weight_fp8, 64.0f, 3 * cfg.C * cfg.C, stream);
+    // Phase 31: If BF16 moments AdamW is active, FP8 weights are written directly by AdamW kernel; standalone quantize eliminated!
+    if (!cfg.use_bf16_moments) {
+        if (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) {
+            launch_quantize_bf16_to_fp8(params.lm_head_weight, params.lm_head_weight_fp8, 64.0f, cfg.vocab_pad * cfg.C, stream);
+        }
+        if (cfg.use_fp8_qkv) {
+            for (int l = 0; l < cfg.num_layers; ++l) {
+                launch_quantize_bf16_to_fp8(params.layers[l].qkv_weight, params.layers[l].qkv_weight_fp8, 64.0f, 3 * cfg.C * cfg.C, stream);
+            }
         }
     }
 }

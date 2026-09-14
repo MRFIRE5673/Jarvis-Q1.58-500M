@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include "full_engine.h"
 
 // Fused AdamW Optimizer Engine
@@ -62,7 +63,9 @@ void launch_fused_adamw_update_bf16_moments(
     float eps,
     float weight_decay,
     int num_elements,
-    cudaStream_t stream
+    cudaStream_t stream,
+    __nv_fp8_e4m3* param_fp8 = nullptr,
+    float scale_fp8 = 64.0f
 );
 
 void launch_fused_adamw_update_f32(

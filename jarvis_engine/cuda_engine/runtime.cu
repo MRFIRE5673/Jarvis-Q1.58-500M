@@ -141,8 +141,8 @@ FullModelWorkspace allocate_full_workspace(const FullJarvisConfig& cfg) {
     // EXP-24-010 Consolidated Grouped AdamW Pointer Tables
     CHECK_CUDA(cudaMalloc(&ws.d_all_moe_experts, 192 * 4 * sizeof(void*)));
     total += 192 * 4 * sizeof(void*);
-    CHECK_CUDA(cudaMalloc(&ws.d_all_qkv, 24 * 4 * sizeof(void*)));
-    total += 24 * 4 * sizeof(void*);
+    CHECK_CUDA(cudaMalloc(&ws.d_all_qkv, 24 * 5 * sizeof(void*)));
+    total += 24 * 5 * sizeof(void*);
     CHECK_CUDA(cudaMalloc(&ws.d_all_out_proj, 24 * 4 * sizeof(void*)));
     total += 24 * 4 * sizeof(void*);
     CHECK_CUDA(cudaMalloc(&ws.d_all_small_params, (24 * 20 + 4) * sizeof(void*)));

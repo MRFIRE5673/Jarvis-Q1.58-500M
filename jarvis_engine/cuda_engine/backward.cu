@@ -1,10 +1,12 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <math.h>
 
 // ---------------------------------------------------------------------------
 // 1. Fused Cross-Entropy Loss & Analytical dLogits Kernel (Online Softmax)
 // Single-pass reduction for global max and sum_exp eliminates redundant DRAM reads
+// Phase 31: Direct FP8 dLogits output eliminates standalone quantization pass
 // ---------------------------------------------------------------------------
 template<int BLOCK_SIZE>
 __global__ void fused_cross_entropy_bwd_kernel(
@@ -12,7 +14,9 @@ __global__ void fused_cross_entropy_bwd_kernel(
     const int32_t* __restrict__ targets,       // (M,)
     __nv_bfloat16* __restrict__ d_logits,     // (M, vocab_pad)
     float* __restrict__ loss_out,              // (1)
-    int M, int vocab_size, int vocab_pad, float loss_scale
+    int M, int vocab_size, int vocab_pad, float loss_scale,
+    __nv_fp8_e4m3* __restrict__ d_logits_fp8 = nullptr,
+    float scale_fp8 = 1048576.0f
 ) {
     int row = blockIdx.x; // Token index in [0, M)
     if (row >= M) return;
@@ -21,6 +25,7 @@ __global__ void fused_cross_entropy_bwd_kernel(
     int target = targets[row];
     const __nv_bfloat16* row_logits = logits + (size_t)row * vocab_pad;
     __nv_bfloat16* row_dlogits = d_logits + (size_t)row * vocab_pad;
+    __nv_fp8_e4m3* row_dlogits_fp8 = d_logits_fp8 ? (d_logits_fp8 + (size_t)row * vocab_pad) : nullptr;
     
     // Pass 1: Online Softmax (Simultaneous global max and sum of exp in a single read pass)
     float m_i = -1e30f;
@@ -89,9 +94,16 @@ __global__ void fused_cross_entropy_bwd_kernel(
             float val = __bfloat162float(row_logits[col]);
             float prob = expf(val - global_max) * inv_sum_exp;
             float grad = (col == target) ? (prob - 1.0f) : prob;
-            row_dlogits[col] = __float2bfloat16(grad * norm_factor);
+            float scaled_grad = grad * norm_factor;
+            row_dlogits[col] = __float2bfloat16(scaled_grad);
+            if (row_dlogits_fp8) {
+                row_dlogits_fp8[col] = __nv_fp8_e4m3(scaled_grad * scale_fp8);
+            }
         } else {
             row_dlogits[col] = __float2bfloat16(0.0f); // Padded columns have zero gradient
+            if (row_dlogits_fp8) {
+                row_dlogits_fp8[col] = __nv_fp8_e4m3(0.0f);
+            }
         }
     }
 }
@@ -102,11 +114,14 @@ void launch_fused_cross_entropy_bwd(
     __nv_bfloat16* d_logits,
     float* loss_out,
     int M, int vocab_size, int vocab_pad, float loss_scale,
-    cudaStream_t stream
+    cudaStream_t stream,
+    __nv_fp8_e4m3* d_logits_fp8,
+    float scale_fp8
 ) {
     const int BLOCK = 256;
     fused_cross_entropy_bwd_kernel<BLOCK><<<M, BLOCK, 0, stream>>>(
-        logits, targets, d_logits, loss_out, M, vocab_size, vocab_pad, loss_scale
+        logits, targets, d_logits, loss_out, M, vocab_size, vocab_pad, loss_scale,
+        d_logits_fp8, scale_fp8
     );
 }
 
