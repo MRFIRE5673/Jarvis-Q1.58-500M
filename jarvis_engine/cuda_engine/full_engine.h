@@ -25,6 +25,7 @@ struct FullJarvisConfig {
     bool use_fp8_lm_head = false; // Phase 28: Native FP8 LM Head forward toggle
     bool use_fp8_lm_head_backward = false; // Phase 28: Native FP8 LM Head backward toggle
     bool use_bf16_moments = false;        // Phase 29: Native BF16 moments optimizer state toggle (14 B/elem)
+    bool use_fp8_qkv = false;             // Phase 30: Native FP8 QKV forward toggle
     
     int M() const { return B * T; }                     // 2048 tokens per microstep
     int total_tokens_per_step() const { return B * T * accum_steps; } // 4096 tokens
@@ -34,6 +35,7 @@ struct FullJarvisConfig {
 struct LayerWeights {
     __nv_bfloat16* norm1_weight;     // (C)
     __nv_bfloat16* qkv_weight;       // (3 * C, C)
+    __nv_fp8_e4m3* qkv_weight_fp8;   // (3 * C, C) Phase 30: FP8 E4M3 pre-scaled
     __nv_bfloat16* out_proj_weight;  // (C, C)
     __nv_bfloat16* norm2_weight;     // (C)
     __nv_bfloat16* router_weight;    // (E, C)
@@ -109,6 +111,7 @@ struct FullModelWorkspace {
     
     // 3. Reusable Active Layer Workspace (Shared across all 24 layers sequentially)
     __nv_bfloat16* layer_x_norm1;    // (M, C)
+    __nv_fp8_e4m3* layer_x_norm1_fp8;// (M, C) Phase 30: FP8 E4M3
     float*         layer_rsqrt1;     // (M)
     __nv_bfloat16* layer_qkv;        // (M, 3 * C)
     __nv_bfloat16* layer_attn_out;   // (M, C)

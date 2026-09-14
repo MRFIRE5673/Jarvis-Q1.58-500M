@@ -110,6 +110,7 @@ void init_full_engine(
         alloc_moments(lay.m_norm1, g_cfg.C);
         alloc_moments(lay.v_norm1, g_cfg.C);
         
+        lay.qkv_weight_fp8 = nullptr;
         alloc_bf16(lay.d_qkv_weight, 3 * g_cfg.C * g_cfg.C);
         alloc_moments(lay.m_qkv, 3 * g_cfg.C * g_cfg.C);
         alloc_moments(lay.v_qkv, 3 * g_cfg.C * g_cfg.C);
@@ -173,6 +174,10 @@ void cleanup_full_engine() {
             free_p((void*&)lay.d_w2_weights[e]);
             free_p((void*&)lay.m_w2[e]);
             free_p((void*&)lay.v_w2[e]);
+        }
+        if (lay.qkv_weight_fp8) {
+            cudaFree(lay.qkv_weight_fp8);
+            lay.qkv_weight_fp8 = nullptr;
         }
         free_p((void*&)lay.d_norm1_weight);
         free_p((void*&)lay.m_norm1);
@@ -290,6 +295,13 @@ void bind_layer_parameters(
         launch_quantize_bf16_to_fp8(lay.w1_weights[e], lay.w1_weights_fp8[e], 64.0f, g_cfg.hidden_dim * g_cfg.C, stream);
         launch_quantize_bf16_to_fp8(lay.w2_weights[e], lay.w2_weights_fp8[e], 64.0f, g_cfg.C * g_cfg.hidden_dim, stream);
     }
+    
+    // Phase 30: Quantize QKV weight to FP8 E4M3 with scale 64.0f
+    if (!lay.qkv_weight_fp8) {
+        cudaMalloc(&lay.qkv_weight_fp8, (size_t)3 * g_cfg.C * g_cfg.C * sizeof(__nv_fp8_e4m3));
+    }
+    launch_quantize_bf16_to_fp8(lay.qkv_weight, lay.qkv_weight_fp8, 64.0f, 3 * g_cfg.C * g_cfg.C, stream);
+    
     g_ws.opt_tables_synced = false;
 }
 
@@ -423,5 +435,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_fp8_lm_head_backward", []() { return g_cfg.use_fp8_lm_head_backward; }, "Phase 28: Get FP8 LM Head backward toggle state");
     m.def("set_use_bf16_moments", [](bool enabled) { g_cfg.use_bf16_moments = enabled; }, "Phase 29: Toggle BF16 moments in AdamW");
     m.def("get_use_bf16_moments", []() { return g_cfg.use_bf16_moments; }, "Phase 29: Get BF16 moments toggle state");
+    m.def("set_fp8_qkv", [](bool enabled) { g_cfg.use_fp8_qkv = enabled; }, "Phase 30: Toggle native FP8 QKV forward execution");
+    m.def("get_fp8_qkv", []() { return g_cfg.use_fp8_qkv; }, "Phase 30: Query native FP8 QKV forward status");
 }
 

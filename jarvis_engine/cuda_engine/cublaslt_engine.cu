@@ -16,8 +16,10 @@ static cublasLtMatmulDesc_t g_desc_tn = nullptr;
 // Pre-configured layout descriptors
 static cublasLtMatrixLayout_t g_layout_x_2048_1024 = nullptr;
 static cublasLtMatrixLayout_t g_layout_w_qkv = nullptr;
+static cublasLtMatrixLayout_t g_layout_w_qkv_fp8 = nullptr;
 static cublasLtMatrixLayout_t g_layout_out_qkv = nullptr;
 static cublasLtMatmulAlgo_t g_algo_qkv_fwd;
+static cublasLtMatmulAlgo_t g_algo_qkv_fwd_fp8;
 
 static cublasLtMatrixLayout_t g_layout_w_attn_out = nullptr;
 static cublasLtMatrixLayout_t g_layout_q_chunk = nullptr;
@@ -255,6 +257,10 @@ void init_cublaslt_engine(size_t workspace_bytes) {
     cublasLtMatrixLayoutCreate(&g_layout_x_2048_1024_fp8, CUDA_R_8F_E4M3, 1024, 2048, 1024);
     g_algo_lm_head_fwd_fp8 = autotune_matmul_algo(g_lt, g_desc_nt_fp8, g_layout_w_lm_head_fp8, g_layout_x_2048_1024_fp8, g_layout_logits, g_layout_logits, pref, d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "LM Head FP8 Fwd", 0);
     
+    // F3. Phase 30: FP8 QKV Forward: C (2048 x 3072) = A (2048 x 1024) * B^T (3072 x 1024).T
+    cublasLtMatrixLayoutCreate(&g_layout_w_qkv_fp8, CUDA_R_8F_E4M3, 1024, 3072, 1024);
+    g_algo_qkv_fwd_fp8 = autotune_matmul_algo(g_lt, g_desc_nt_fp8, g_layout_w_qkv_fp8, g_layout_x_2048_1024_fp8, g_layout_out_qkv, g_layout_out_qkv, pref, d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "QKV Fwd FP8", 0);
+    
     // G. LM Head Bwd dX: C (2048 x 1024) = A (2048 x 50304) * B (50304 x 1024)
     cublasLtMatrixLayoutCreate(&g_layout_w_lm_head_nn, CUDA_R_16BF, 1024, 50304, 1024);
     cublasLtMatrixLayoutCreate(&g_layout_d_logits_nn, CUDA_R_16BF, 50304, 2048, 50304);
@@ -354,6 +360,7 @@ void cleanup_cublaslt_engine() {
     cublasLtMatrixLayoutDestroy(g_layout_out_qkv);
     cublasLtMatrixLayoutDestroy(g_layout_x_2048_1024);
     cublasLtMatrixLayoutDestroy(g_layout_w_qkv);
+    if (g_layout_w_qkv_fp8) { cublasLtMatrixLayoutDestroy(g_layout_w_qkv_fp8); g_layout_w_qkv_fp8 = nullptr; }
     
     cublasLtMatmulDescDestroy(g_desc_tn);
     cublasLtMatmulDescDestroy(g_desc_nn);
@@ -380,6 +387,19 @@ void cublaslt_gemm_qkv_fwd(
         g_lt, g_desc_nt, &alpha, w_qkv, g_layout_w_qkv, x, g_layout_x_2048_1024,
         &beta, out_qkv, g_layout_out_qkv, out_qkv, g_layout_out_qkv,
         &g_algo_qkv_fwd, g_ws, g_ws_size, stream
+    );
+}
+
+// Phase 30: FP8 QKV Forward GEMM (CUDA_R_8F_E4M3 inputs, FP32 accumulator, BF16 output)
+void cublaslt_gemm_qkv_fwd_fp8(
+    const __nv_fp8_e4m3* x, const __nv_fp8_e4m3* w_qkv, __nv_bfloat16* out_qkv,
+    int M, int C, int N, float alpha, cudaStream_t stream
+) {
+    float beta = 0.0f;
+    cublasLtMatmul(
+        g_lt, g_desc_nt_fp8, &alpha, w_qkv, g_layout_w_qkv_fp8, x, g_layout_x_2048_1024_fp8,
+        &beta, out_qkv, g_layout_out_qkv, out_qkv, g_layout_out_qkv,
+        &g_algo_qkv_fwd_fp8, g_ws, g_ws_size, stream
     );
 }
 

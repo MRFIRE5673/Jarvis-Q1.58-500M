@@ -112,7 +112,12 @@ void run_full_model_forward(
         );
         
         // Step 2b: Fused QKV GEMM: (M, C) @ (3C, C).T -> (M, 3C)
-        cublaslt_gemm_qkv_fwd(ws.layer_x_norm1, lay.qkv_weight, ws.layer_qkv, M, C, stream);
+        if (cfg.use_fp8_qkv) {
+            launch_quantize_bf16_to_fp8(ws.layer_x_norm1, ws.layer_x_norm1_fp8, 16.0f, M * C, stream);
+            cublaslt_gemm_qkv_fwd_fp8(ws.layer_x_norm1_fp8, lay.qkv_weight_fp8, ws.layer_qkv, M, C, 3 * C, 1.0f / (16.0f * 64.0f), stream);
+        } else {
+            cublaslt_gemm_qkv_fwd(ws.layer_x_norm1, lay.qkv_weight, ws.layer_qkv, M, C, stream);
+        }
         
         // Step 2c: Attention Out Projection GEMM: (M, C) @ (C, C).T -> (M, C)
         // First C elements of layer_qkv is q_chunk
@@ -303,6 +308,12 @@ void run_native_training_step(
     if (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) {
         launch_quantize_bf16_to_fp8(params.lm_head_weight, params.lm_head_weight_fp8, 64.0f, cfg.vocab_pad * cfg.C, stream);
     }
+    // Phase 30: If FP8 QKV is used, re-quantize layer QKV weights to guarantee NO stale buffers
+    if (cfg.use_fp8_qkv) {
+        for (int l = 0; l < cfg.num_layers; ++l) {
+            launch_quantize_bf16_to_fp8(params.layers[l].qkv_weight, params.layers[l].qkv_weight_fp8, 64.0f, 3 * cfg.C * cfg.C, stream);
+        }
+    }
 }
 
 
@@ -357,7 +368,12 @@ void run_interleaved_forward(
             launch_fused_rmsnorm_fwd(cur_x[ms], lay.norm1_weight, ws.layer_x_norm1, ws.layer_rsqrt1, M, C, eps, stream);
             
             // Step 2b: Fused QKV GEMM
-            cublaslt_gemm_qkv_fwd(ws.layer_x_norm1, lay.qkv_weight, ws.layer_qkv, M, C, stream);
+            if (cfg.use_fp8_qkv) {
+                launch_quantize_bf16_to_fp8(ws.layer_x_norm1, ws.layer_x_norm1_fp8, 16.0f, M * C, stream);
+                cublaslt_gemm_qkv_fwd_fp8(ws.layer_x_norm1_fp8, lay.qkv_weight_fp8, ws.layer_qkv, M, C, 3 * C, 1.0f / (16.0f * 64.0f), stream);
+            } else {
+                cublaslt_gemm_qkv_fwd(ws.layer_x_norm1, lay.qkv_weight, ws.layer_qkv, M, C, stream);
+            }
             
             // Step 2c: Attention Out GEMM
             cublaslt_gemm_attn_out_fwd(ws.layer_qkv, lay.out_proj_weight, ws.layer_attn_out, M, C, stream);
@@ -520,6 +536,12 @@ void run_native_training_step_interleaved(
     // Phase 28: If FP8 LM Head is used (fwd or bwd), re-quantize lm_head_weight to guarantee NO stale buffers
     if (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) {
         launch_quantize_bf16_to_fp8(params.lm_head_weight, params.lm_head_weight_fp8, 64.0f, cfg.vocab_pad * cfg.C, stream);
+    }
+    // Phase 30: If FP8 QKV is used, re-quantize layer QKV weights to guarantee NO stale buffers
+    if (cfg.use_fp8_qkv) {
+        for (int l = 0; l < cfg.num_layers; ++l) {
+            launch_quantize_bf16_to_fp8(params.layers[l].qkv_weight, params.layers[l].qkv_weight_fp8, 64.0f, 3 * cfg.C * cfg.C, stream);
+        }
     }
 }
 

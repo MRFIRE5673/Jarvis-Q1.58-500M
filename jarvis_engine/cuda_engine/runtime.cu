@@ -91,6 +91,7 @@ FullModelWorkspace allocate_full_workspace(const FullJarvisConfig& cfg) {
     
     // 3. Reusable Active Layer Workspace (Shared across all 24 layers sequentially)
     alloc_bf16(ws.layer_x_norm1, M * C);
+    alloc_fp8(ws.layer_x_norm1_fp8, M * C);
     alloc_f32(ws.layer_rsqrt1, M);
     alloc_bf16(ws.layer_qkv, M * 3 * C);
     alloc_bf16(ws.layer_attn_out, M * C);
@@ -182,6 +183,7 @@ void free_full_workspace(FullModelWorkspace& ws) {
     }
     
     free_p((void*&)ws.layer_x_norm1);
+    free_p((void*&)ws.layer_x_norm1_fp8);
     free_p((void*&)ws.layer_rsqrt1);
     free_p((void*&)ws.layer_qkv);
     free_p((void*&)ws.layer_attn_out);

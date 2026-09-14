@@ -15,6 +15,12 @@ void cublaslt_gemm_qkv_fwd(
     int M, int C, cudaStream_t stream
 );
 
+// Phase 30: FP8 QKV Forward GEMM (CUDA_R_8F_E4M3 inputs, FP32 accumulator, BF16 output)
+void cublaslt_gemm_qkv_fwd_fp8(
+    const __nv_fp8_e4m3* x, const __nv_fp8_e4m3* w_qkv, __nv_bfloat16* out_qkv,
+    int M, int C, int N, float alpha, cudaStream_t stream
+);
+
 void cublaslt_gemm_attn_out_fwd(
     const __nv_bfloat16* q_chunk, const __nv_bfloat16* w_out, __nv_bfloat16* out_attn,
     int M, int C, cudaStream_t stream
