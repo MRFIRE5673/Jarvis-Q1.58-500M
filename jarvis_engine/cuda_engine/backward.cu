@@ -151,7 +151,9 @@ __global__ void tok_emb_fwd_kernel(
     const int32_t* __restrict__ input_ids,
     const __nv_bfloat16* __restrict__ emb_weight,
     __nv_bfloat16* __restrict__ out,
-    int M, int C
+    int M, int C,
+    __nv_fp8_e4m3* __restrict__ out_fp8 = nullptr,
+    float scale_fp8 = 16.0f
 ) {
     int token_idx = blockIdx.x;
     if (token_idx >= M) return;
@@ -159,9 +161,20 @@ __global__ void tok_emb_fwd_kernel(
     int id = input_ids[token_idx];
     const __nv_bfloat16* src = emb_weight + (size_t)id * C;
     __nv_bfloat16* dst = out + (size_t)token_idx * C;
+    __nv_fp8_e4m3* dst_fp8 = out_fp8 ? (out_fp8 + (size_t)token_idx * C) : nullptr;
     
-    for (int c = threadIdx.x; c < C; c += blockDim.x) {
-        dst[c] = src[c];
+    for (int c = threadIdx.x * 8; c < C; c += blockDim.x * 8) {
+        uint4 raw = *reinterpret_cast<const uint4*>(src + c);
+        *reinterpret_cast<uint4*>(dst + c) = raw;
+        if (dst_fp8) {
+            const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(&raw);
+            __nv_fp8_e4m3 res[8];
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                res[k] = __nv_fp8_e4m3(__bfloat162float(v[k]) * scale_fp8);
+            }
+            *reinterpret_cast<uint2*>(dst_fp8 + c) = *reinterpret_cast<uint2*>(res);
+        }
     }
 }
 
@@ -170,10 +183,12 @@ void launch_tok_emb_fwd(
     const __nv_bfloat16* emb_weight,
     __nv_bfloat16* out,
     int M, int C,
-    cudaStream_t stream
+    cudaStream_t stream,
+    __nv_fp8_e4m3* out_fp8 = nullptr,
+    float scale_fp8 = 16.0f
 ) {
     const int BLOCK = 256;
-    tok_emb_fwd_kernel<<<M, BLOCK, 0, stream>>>(input_ids, emb_weight, out, M, C);
+    tok_emb_fwd_kernel<<<M, BLOCK, 0, stream>>>(input_ids, emb_weight, out, M, C, out_fp8, scale_fp8);
 }
 
 __global__ void tok_emb_bwd_kernel(

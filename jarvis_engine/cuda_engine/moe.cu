@@ -346,7 +346,9 @@ __global__ void moe_scatter_combine_add_residual_kernel(
     const int32_t* __restrict__ scatter_map,
     const __nv_bfloat16* __restrict__ x1,
     __nv_bfloat16* __restrict__ x2,
-    int M, int C
+    int M, int C,
+    __nv_fp8_e4m3* __restrict__ x2_fp8 = nullptr,
+    float scale_fp8 = 16.0f
 ) {
     int token_idx = blockIdx.x;
     if (token_idx >= M) return;
@@ -360,12 +362,33 @@ __global__ void moe_scatter_combine_add_residual_kernel(
     const __nv_bfloat16* y1 = dispatched_y + (size_t)slot1 * C;
     const __nv_bfloat16* src_x1 = x1 + (size_t)token_idx * C;
     __nv_bfloat16* dst = x2 + (size_t)token_idx * C;
+    __nv_fp8_e4m3* dst_fp8 = x2_fp8 ? (x2_fp8 + (size_t)token_idx * C) : nullptr;
     
-    for (int c = threadIdx.x; c < C; c += blockDim.x) {
-        float val0 = __bfloat162float(y0[c]);
-        float val1 = __bfloat162float(y1[c]);
-        float vx1 = __bfloat162float(src_x1[c]);
-        dst[c] = __float2bfloat16(vx1 + g0 * val0 + g1 * val1);
+    for (int c = threadIdx.x * 8; c < C; c += blockDim.x * 8) {
+        uint4 raw_y0 = *reinterpret_cast<const uint4*>(y0 + c);
+        uint4 raw_y1 = *reinterpret_cast<const uint4*>(y1 + c);
+        uint4 raw_x1 = *reinterpret_cast<const uint4*>(src_x1 + c);
+        
+        const __nv_bfloat16* vy0 = reinterpret_cast<const __nv_bfloat16*>(&raw_y0);
+        const __nv_bfloat16* vy1 = reinterpret_cast<const __nv_bfloat16*>(&raw_y1);
+        const __nv_bfloat16* vx1 = reinterpret_cast<const __nv_bfloat16*>(&raw_x1);
+        
+        __nv_bfloat16 res_bf16[8];
+        __nv_fp8_e4m3 res_fp8[8];
+        
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            float v = __bfloat162float(vx1[k]) + g0 * __bfloat162float(vy0[k]) + g1 * __bfloat162float(vy1[k]);
+            res_bf16[k] = __float2bfloat16(v);
+            if (dst_fp8) {
+                res_fp8[k] = __nv_fp8_e4m3(v * scale_fp8);
+            }
+        }
+        
+        *reinterpret_cast<uint4*>(dst + c) = *reinterpret_cast<uint4*>(res_bf16);
+        if (dst_fp8) {
+            *reinterpret_cast<uint2*>(dst_fp8 + c) = *reinterpret_cast<uint2*>(res_fp8);
+        }
     }
 }
 
@@ -376,11 +399,13 @@ void launch_moe_scatter_combine_add_residual(
     const __nv_bfloat16* x1,
     __nv_bfloat16* x2,
     int M, int C,
-    cudaStream_t stream
+    cudaStream_t stream,
+    __nv_fp8_e4m3* x2_fp8 = nullptr,
+    float scale_fp8 = 16.0f
 ) {
     const int BLOCK = 256;
     moe_scatter_combine_add_residual_kernel<<<M, BLOCK, 0, stream>>>(
-        dispatched_y, topk_gates, scatter_map, x1, x2, M, C
+        dispatched_y, topk_gates, scatter_map, x1, x2, M, C, x2_fp8, scale_fp8
     );
 }
 

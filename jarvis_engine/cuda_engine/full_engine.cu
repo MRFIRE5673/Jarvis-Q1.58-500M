@@ -67,6 +67,12 @@ void launch_moe_dispatch_gather_fp8(
     int total_dispatched, int C, cudaStream_t stream
 );
 
+void launch_tok_emb_fwd(
+    const int32_t* input_ids, const __nv_bfloat16* emb_weight,
+    __nv_bfloat16* out, int M, int C, cudaStream_t stream,
+    __nv_fp8_e4m3* out_fp8 = nullptr, float scale_fp8 = 16.0f
+);
+
 void launch_moe_scatter_combine(
     const __nv_bfloat16* dispatched_y, const float* topk_gates, const int32_t* scatter_map,
     __nv_bfloat16* out, int M, int C, cudaStream_t stream
@@ -74,7 +80,8 @@ void launch_moe_scatter_combine(
 
 void launch_moe_scatter_combine_add_residual(
     const __nv_bfloat16* dispatched_y, const float* topk_gates, const int32_t* scatter_map,
-    const __nv_bfloat16* x1, __nv_bfloat16* x2, int M, int C, cudaStream_t stream
+    const __nv_bfloat16* x1, __nv_bfloat16* x2, int M, int C, cudaStream_t stream,
+    __nv_fp8_e4m3* x2_fp8 = nullptr, float scale_fp8 = 16.0f
 );
 
 // Phase 28: FP8 MoE Quantization & Fused GELU
@@ -102,21 +109,16 @@ void run_full_model_forward(
     auto options_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
     auto options_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     
-    // 1. Token Embeddings: input_ids -> ws.emb_out
-    launch_tok_emb_fwd(ws.input_ids, params.tok_emb_weight, ws.emb_out, M, C, stream);
-    
-    // Pointer to current layer input (starts with embedding output)
-    __nv_bfloat16* cur_x = ws.emb_out;
+    // 1. Token Embeddings: input_ids -> ws.stashed_x[0] (and direct FP8 stashing)
+    launch_tok_emb_fwd(
+        ws.input_ids, params.tok_emb_weight, ws.stashed_x[0], M, C, stream,
+        cfg.use_fp8_qkv_backward ? ws.stashed_x_fp8[0] : nullptr, 16.0f
+    );
+    __nv_bfloat16* cur_x = ws.stashed_x[0];
     
     // 2. Loop through all 24 layers sequentially (L2-pinned layer_x2 active staging)
     for (int l = 0; l < cfg.num_layers; ++l) {
         const auto& lay = params.layers[l];
-        
-        // Stash layer input for exact analytical backward recomputation (100.66 MB total across 24 layers)
-        cudaMemcpyAsync(ws.stashed_x[l], cur_x, M * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
-        if (cfg.use_fp8_qkv_backward) {
-            launch_quantize_bf16_to_fp8(cur_x, ws.stashed_x_fp8[l], 16.0f, M * C, stream);
-        }
         
         // Step 2a: Fused RMSNorm 1: cur_x -> ws.layer_x_norm1 (or direct FP8)
         if (cfg.use_fused_rmsnorm_quant && cfg.use_fp8_qkv) {
@@ -200,14 +202,21 @@ void run_full_model_forward(
             cublaslt_gemm_moe_w2_fwd(ws.layer_act, lay.w2_weights[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, stream);
         }
         
-        // Step 2h+2i: Fused MoE Scatter Combine + Residual 2 Addition (Single Memory Pass)
-        launch_moe_scatter_combine_add_residual(
-            ws.layer_dispatched_y, ws.layer_topk_gates, ws.layer_scatter_map,
-            ws.layer_x1, ws.layer_x2, M, C, stream
-        );
-        
-        // Layer output becomes input to next layer
-        cur_x = ws.layer_x2;
+        // Step 2h+2i: Fused MoE Scatter Combine + Residual 2 Addition (Direct next-layer stashing!)
+        if (l < cfg.num_layers - 1) {
+            launch_moe_scatter_combine_add_residual(
+                ws.layer_dispatched_y, ws.layer_topk_gates, ws.layer_scatter_map,
+                ws.layer_x1, ws.stashed_x[l + 1], M, C, stream,
+                cfg.use_fp8_qkv_backward ? ws.stashed_x_fp8[l + 1] : nullptr, 16.0f
+            );
+            cur_x = ws.stashed_x[l + 1];
+        } else {
+            launch_moe_scatter_combine_add_residual(
+                ws.layer_dispatched_y, ws.layer_topk_gates, ws.layer_scatter_map,
+                ws.layer_x1, ws.layer_x2, M, C, stream
+            );
+            cur_x = ws.layer_x2;
+        }
     }
     
     // 3. Final RMSNorm: cur_x -> ws.final_norm_out
@@ -395,11 +404,15 @@ void run_interleaved_forward(
     float eps = 1e-6f;
     auto options_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
     
-    // 1. Token Embeddings for both microsteps
-    launch_tok_emb_fwd(ws.input_ids_ms[0], params.tok_emb_weight, ws.emb_out_ms[0], M, C, stream);
-    launch_tok_emb_fwd(ws.input_ids_ms[1], params.tok_emb_weight, ws.emb_out_ms[1], M, C, stream);
+    // 1. Token Embeddings for both microsteps (directly stashed to layer 0 BF16 & FP8)
+    for (int ms = 0; ms < 2; ++ms) {
+        launch_tok_emb_fwd(
+            ws.input_ids_ms[ms], params.tok_emb_weight, ws.stashed_x_ms[ms][0], M, C, stream,
+            cfg.use_fp8_qkv_backward ? ws.stashed_x_fp8_ms[ms][0] : nullptr, 16.0f
+        );
+    }
     
-    __nv_bfloat16* cur_x[2] = { ws.emb_out_ms[0], ws.emb_out_ms[1] };
+    __nv_bfloat16* cur_x[2] = { ws.stashed_x_ms[0][0], ws.stashed_x_ms[1][0] };
     
     // Static tensor wrappers for shared active workspace
     auto qkv_t = torch::from_blob(ws.layer_qkv, {M, 3 * C}, options_bf16);
@@ -424,10 +437,8 @@ void run_interleaved_forward(
         
         // Microstep 0 followed immediately by Microstep 1
         for (int ms = 0; ms < 2; ++ms) {
-            cudaMemcpyAsync(ws.stashed_x_ms[ms][l], cur_x[ms], M * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
-            if (cfg.use_fp8_qkv_backward) {
-                launch_quantize_bf16_to_fp8(cur_x[ms], ws.stashed_x_fp8_ms[ms][l], 16.0f, M * C, stream);
-            }
+            // cur_x[ms] is already ws.stashed_x_ms[ms][l]!
+            // ws.stashed_x_fp8_ms[ms][l] is already pre-quantized from previous residual pass!
             
             // Step 2a: Fused RMSNorm 1
             if (cfg.use_fused_rmsnorm_quant && cfg.use_fp8_qkv) {
@@ -490,13 +501,21 @@ void run_interleaved_forward(
                 cublaslt_gemm_moe_w2_fwd(ws.layer_act, lay.w2_weights[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, stream);
             }
             
-            // Step 2h+2i: Fused MoE Scatter Combine + Residual 2 Addition (Single Memory Pass)
-            launch_moe_scatter_combine_add_residual(
-                ws.layer_dispatched_y, ws.layer_topk_gates, ws.layer_scatter_map,
-                ws.layer_x1, ws.layer_x2_ms[ms], M, C, stream
-            );
-            
-            cur_x[ms] = ws.layer_x2_ms[ms];
+            // Step 2h+2i: Fused MoE Scatter Combine + Residual 2 Addition (Direct next-layer stashing!)
+            if (l < cfg.num_layers - 1) {
+                launch_moe_scatter_combine_add_residual(
+                    ws.layer_dispatched_y, ws.layer_topk_gates, ws.layer_scatter_map,
+                    ws.layer_x1, ws.stashed_x_ms[ms][l + 1], M, C, stream,
+                    cfg.use_fp8_qkv_backward ? ws.stashed_x_fp8_ms[ms][l + 1] : nullptr, 16.0f
+                );
+                cur_x[ms] = ws.stashed_x_ms[ms][l + 1];
+            } else {
+                launch_moe_scatter_combine_add_residual(
+                    ws.layer_dispatched_y, ws.layer_topk_gates, ws.layer_scatter_map,
+                    ws.layer_x1, ws.layer_x2_ms[ms], M, C, stream
+                );
+                cur_x[ms] = ws.layer_x2_ms[ms];
+            }
         }
     }
     

@@ -246,7 +246,7 @@ void init_cublaslt_engine(size_t workspace_bytes) {
     
     cublasLtMatrixLayoutCreate(&g_layout_w2_fp8, CUDA_R_8F_E4M3, 2048, 1024, 2048);
     cublasLtMatrixLayoutCreate(&g_layout_act_fp8, CUDA_R_8F_E4M3, 2048, 4096, 2048);
-    g_algo_w2_fp8 = autotune_matmul_algo(g_lt, g_desc_nt_fp8, g_layout_w2_fp8, g_layout_act_fp8, g_layout_disp_y, g_layout_disp_y, pref, d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "MoE W2 FP8", 1);
+    g_algo_w2_fp8 = autotune_matmul_algo(g_lt, g_desc_nt_fp8, g_layout_w2_fp8, g_layout_act_fp8, g_layout_disp_y, g_layout_disp_y, pref, d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "MoE W2 FP8", 0);
     
     // F. LM Head Forward: C (2048 x 50304) = A (2048 x 1024) * B^T (50304 x 1024).T
     cublasLtMatrixLayoutCreate(&g_layout_w_lm_head, CUDA_R_16BF, 1024, 50304, 1024);
@@ -256,7 +256,7 @@ void init_cublaslt_engine(size_t workspace_bytes) {
     // F2. Phase 28: FP8 LM Head Forward
     cublasLtMatrixLayoutCreate(&g_layout_w_lm_head_fp8, CUDA_R_8F_E4M3, 1024, 50304, 1024);
     cublasLtMatrixLayoutCreate(&g_layout_x_2048_1024_fp8, CUDA_R_8F_E4M3, 1024, 2048, 1024);
-    g_algo_lm_head_fwd_fp8 = autotune_matmul_algo(g_lt, g_desc_nt_fp8, g_layout_w_lm_head_fp8, g_layout_x_2048_1024_fp8, g_layout_logits, g_layout_logits, pref, d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "LM Head FP8 Fwd", 0);
+    g_algo_lm_head_fwd_fp8 = autotune_matmul_algo(g_lt, g_desc_nt_fp8, g_layout_w_lm_head_fp8, g_layout_x_2048_1024_fp8, g_layout_logits, g_layout_logits, pref, d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "LM Head FP8 Fwd", 1);
     
     // F3. Phase 30: FP8 QKV Forward: C (2048 x 3072) = A (2048 x 1024) * B^T (3072 x 1024).T
     cublasLtMatrixLayoutCreate(&g_layout_w_qkv_fp8, CUDA_R_8F_E4M3, 1024, 3072, 1024);
@@ -289,7 +289,7 @@ void init_cublaslt_engine(size_t workspace_bytes) {
     g_algo_lm_head_bwd_dx_fp8 = autotune_matmul_algo(
         g_lt, g_desc_nn_fp8, g_layout_w_lm_head_fp8, g_layout_d_logits_nn_fp8,
         g_layout_d_final_norm_nn, g_layout_d_final_norm_nn, pref,
-        d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "LM Head Bwd dX FP8", 0
+        d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "LM Head Bwd dX FP8", 1
     );
 
     g_algo_lm_head_bwd_dw_fp8 = autotune_matmul_algo(
