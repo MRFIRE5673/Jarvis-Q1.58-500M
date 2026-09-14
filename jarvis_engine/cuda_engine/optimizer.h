@@ -68,6 +68,25 @@ void launch_fused_adamw_update_bf16_moments(
     float scale_fp8 = 64.0f
 );
 
+void launch_fused_adamw_update_fp8_moments(
+    __nv_bfloat16* param,
+    __nv_bfloat16* grad,
+    __nv_fp8_e4m3* m,
+    __nv_fp8_e5m2* v,
+    const float* clip_coef,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    int num_elements,
+    cudaStream_t stream,
+    __nv_fp8_e4m3* param_fp8 = nullptr,
+    float scale_fp8 = 64.0f,
+    float scale_m = 256.0f,
+    float scale_v = 512.0f
+);
+
 void launch_fused_adamw_update_f32(
     float* param,
     float* grad,

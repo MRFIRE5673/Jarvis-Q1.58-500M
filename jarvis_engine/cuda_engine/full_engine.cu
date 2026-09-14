@@ -374,8 +374,8 @@ void run_native_training_step(
     // Fused AdamW optimizer update with in-kernel norm clipping and zero_grad
     run_fused_optimizer_step(params, ws, cfg, lr, stream);
     
-    // Phase 31: If BF16 moments AdamW is active, FP8 weights are written directly by AdamW kernel; standalone quantize eliminated!
-    if (!cfg.use_bf16_moments) {
+    // Phase 31: If BF16/FP8 moments AdamW is active, FP8 weights are written directly by AdamW kernel; standalone quantize eliminated!
+    if (!cfg.use_bf16_moments && !cfg.use_fp8_moments) {
         if (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) {
             launch_quantize_bf16_to_fp8(params.lm_head_weight, params.lm_head_weight_fp8, 64.0f, cfg.vocab_pad * cfg.C, stream);
         }
@@ -660,8 +660,8 @@ void run_native_training_step_interleaved(
     run_interleaved_backward(cfg, ws, params, stream);
     run_fused_optimizer_step(params, ws, cfg, lr, stream);
     
-    // Phase 31: If BF16 moments AdamW is active, FP8 weights are written directly by AdamW kernel; standalone quantize eliminated!
-    if (!cfg.use_bf16_moments) {
+    // Phase 31: If BF16/FP8 moments AdamW is active, FP8 weights are written directly by AdamW kernel; standalone quantize eliminated!
+    if (!cfg.use_bf16_moments && !cfg.use_fp8_moments) {
         if (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) {
             launch_quantize_bf16_to_fp8(params.lm_head_weight, params.lm_head_weight_fp8, 64.0f, cfg.vocab_pad * cfg.C, stream);
         }

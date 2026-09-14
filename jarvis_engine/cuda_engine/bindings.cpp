@@ -82,8 +82,23 @@ void init_full_engine(
         cudaMalloc(&ptr, count * sizeof(__nv_bfloat16));
         cudaMemset(ptr, 0, count * sizeof(__nv_bfloat16));
     };
-    auto alloc_moments = [](auto& ptr, size_t count) {
-        if (g_cfg.use_bf16_moments) {
+    auto alloc_moments_m = [](auto& ptr, size_t count) {
+        if (g_cfg.use_fp8_moments) {
+            cudaMalloc((void**)&ptr, count * sizeof(__nv_fp8_e4m3));
+            cudaMemset(ptr, 0, count * sizeof(__nv_fp8_e4m3));
+        } else if (g_cfg.use_bf16_moments) {
+            cudaMalloc((void**)&ptr, count * sizeof(__nv_bfloat16));
+            cudaMemset(ptr, 0, count * sizeof(__nv_bfloat16));
+        } else {
+            cudaMalloc((void**)&ptr, count * sizeof(float));
+            cudaMemset(ptr, 0, count * sizeof(float));
+        }
+    };
+    auto alloc_moments_v = [](auto& ptr, size_t count) {
+        if (g_cfg.use_fp8_moments) {
+            cudaMalloc((void**)&ptr, count * sizeof(__nv_fp8_e5m2));
+            cudaMemset(ptr, 0, count * sizeof(__nv_fp8_e5m2));
+        } else if (g_cfg.use_bf16_moments) {
             cudaMalloc((void**)&ptr, count * sizeof(__nv_bfloat16));
             cudaMemset(ptr, 0, count * sizeof(__nv_bfloat16));
         } else {
@@ -93,48 +108,48 @@ void init_full_engine(
     };
     
     alloc_bf16(g_params.d_tok_emb_weight, g_cfg.vocab_size * g_cfg.C);
-    alloc_moments(g_params.m_tok_emb, g_cfg.vocab_size * g_cfg.C);
-    alloc_moments(g_params.v_tok_emb, g_cfg.vocab_size * g_cfg.C);
+    alloc_moments_m(g_params.m_tok_emb, g_cfg.vocab_size * g_cfg.C);
+    alloc_moments_v(g_params.v_tok_emb, g_cfg.vocab_size * g_cfg.C);
     
     alloc_bf16(g_params.d_final_norm_weight, g_cfg.C);
-    alloc_moments(g_params.m_final_norm, g_cfg.C);
-    alloc_moments(g_params.v_final_norm, g_cfg.C);
+    alloc_moments_m(g_params.m_final_norm, g_cfg.C);
+    alloc_moments_v(g_params.v_final_norm, g_cfg.C);
     
     alloc_bf16(g_params.d_lm_head_weight, g_cfg.vocab_pad * g_cfg.C);
-    alloc_moments(g_params.m_lm_head, g_cfg.vocab_pad * g_cfg.C);
-    alloc_moments(g_params.v_lm_head, g_cfg.vocab_pad * g_cfg.C);
+    alloc_moments_m(g_params.m_lm_head, g_cfg.vocab_pad * g_cfg.C);
+    alloc_moments_v(g_params.v_lm_head, g_cfg.vocab_pad * g_cfg.C);
     
     for (int l = 0; l < g_cfg.num_layers; ++l) {
         auto& lay = g_params.layers[l];
         alloc_bf16(lay.d_norm1_weight, g_cfg.C);
-        alloc_moments(lay.m_norm1, g_cfg.C);
-        alloc_moments(lay.v_norm1, g_cfg.C);
+        alloc_moments_m(lay.m_norm1, g_cfg.C);
+        alloc_moments_v(lay.v_norm1, g_cfg.C);
         
         lay.qkv_weight_fp8 = nullptr;
         alloc_bf16(lay.d_qkv_weight, 3 * g_cfg.C * g_cfg.C);
-        alloc_moments(lay.m_qkv, 3 * g_cfg.C * g_cfg.C);
-        alloc_moments(lay.v_qkv, 3 * g_cfg.C * g_cfg.C);
+        alloc_moments_m(lay.m_qkv, 3 * g_cfg.C * g_cfg.C);
+        alloc_moments_v(lay.v_qkv, 3 * g_cfg.C * g_cfg.C);
         
         alloc_bf16(lay.d_out_proj_weight, g_cfg.C * g_cfg.C);
-        alloc_moments(lay.m_out, g_cfg.C * g_cfg.C);
-        alloc_moments(lay.v_out, g_cfg.C * g_cfg.C);
+        alloc_moments_m(lay.m_out, g_cfg.C * g_cfg.C);
+        alloc_moments_v(lay.v_out, g_cfg.C * g_cfg.C);
         
         alloc_bf16(lay.d_norm2_weight, g_cfg.C);
-        alloc_moments(lay.m_norm2, g_cfg.C);
-        alloc_moments(lay.v_norm2, g_cfg.C);
+        alloc_moments_m(lay.m_norm2, g_cfg.C);
+        alloc_moments_v(lay.v_norm2, g_cfg.C);
         
         alloc_bf16(lay.d_router_weight, g_cfg.E * g_cfg.C);
-        alloc_moments(lay.m_router, g_cfg.E * g_cfg.C);
-        alloc_moments(lay.v_router, g_cfg.E * g_cfg.C);
+        alloc_moments_m(lay.m_router, g_cfg.E * g_cfg.C);
+        alloc_moments_v(lay.v_router, g_cfg.E * g_cfg.C);
         
         for (int e = 0; e < g_cfg.E; ++e) {
             alloc_bf16(lay.d_w1_weights[e], g_cfg.hidden_dim * g_cfg.C);
-            alloc_moments(lay.m_w1[e], g_cfg.hidden_dim * g_cfg.C);
-            alloc_moments(lay.v_w1[e], g_cfg.hidden_dim * g_cfg.C);
+            alloc_moments_m(lay.m_w1[e], g_cfg.hidden_dim * g_cfg.C);
+            alloc_moments_v(lay.v_w1[e], g_cfg.hidden_dim * g_cfg.C);
             
             alloc_bf16(lay.d_w2_weights[e], g_cfg.C * g_cfg.hidden_dim);
-            alloc_moments(lay.m_w2[e], g_cfg.C * g_cfg.hidden_dim);
-            alloc_moments(lay.v_w2[e], g_cfg.C * g_cfg.hidden_dim);
+            alloc_moments_m(lay.m_w2[e], g_cfg.C * g_cfg.hidden_dim);
+            alloc_moments_v(lay.v_w2[e], g_cfg.C * g_cfg.hidden_dim);
         }
         
         alloc_f32(lay.d_gamma_raw, g_cfg.H);
@@ -435,6 +450,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_fp8_lm_head_backward", []() { return g_cfg.use_fp8_lm_head_backward; }, "Phase 28: Get FP8 LM Head backward toggle state");
     m.def("set_use_bf16_moments", [](bool enabled) { g_cfg.use_bf16_moments = enabled; }, "Phase 29: Toggle BF16 moments in AdamW");
     m.def("get_use_bf16_moments", []() { return g_cfg.use_bf16_moments; }, "Phase 29: Get BF16 moments toggle state");
+    m.def("set_use_fp8_moments", [](bool enabled) { g_cfg.use_fp8_moments = enabled; }, "Phase 31: Toggle FP8 moments in AdamW");
+    m.def("get_use_fp8_moments", []() { return g_cfg.use_fp8_moments; }, "Phase 31: Get FP8 moments toggle state");
     m.def("set_fp8_qkv", [](bool enabled) { g_cfg.use_fp8_qkv = enabled; }, "Phase 30: Toggle native FP8 QKV forward execution");
     m.def("get_fp8_qkv", []() { return g_cfg.use_fp8_qkv; }, "Phase 30: Query native FP8 QKV forward status");
     m.def("set_fused_rmsnorm_quant", [](bool enabled) { g_cfg.use_fused_rmsnorm_quant = enabled; }, "Phase 31: Toggle native fused RMSNorm + FP8 quant");

@@ -25,6 +25,7 @@ struct FullJarvisConfig {
     bool use_fp8_lm_head = false; // Phase 28: Native FP8 LM Head forward toggle
     bool use_fp8_lm_head_backward = false; // Phase 28: Native FP8 LM Head backward toggle
     bool use_bf16_moments = false;        // Phase 29: Native BF16 moments optimizer state toggle (14 B/elem)
+    bool use_fp8_moments = false;         // Phase 31: Native FP8 moments optimizer state toggle (10 B/elem)
     bool use_fp8_qkv = false;             // Phase 30: Native FP8 QKV forward toggle
     bool use_fused_rmsnorm_quant = true;  // Phase 31: Native Fused RMSNorm + FP8 Activation Quantization toggle
     bool use_fp8_qkv_backward = true;     // Phase 31: Native FP8 QKV backward toggle
@@ -59,21 +60,21 @@ struct LayerWeights {
     float*         d_gamma_raw;
     float*         d_var_scale;
     
-    // AdamW momentum buffers (dual precision: FP32 or BF16)
-    union { float* m_norm1; __nv_bfloat16* m_norm1_bf16; };
-    union { float* v_norm1; __nv_bfloat16* v_norm1_bf16; };
-    union { float* m_qkv;   __nv_bfloat16* m_qkv_bf16; };
-    union { float* v_qkv;   __nv_bfloat16* v_qkv_bf16; };
-    union { float* m_out;   __nv_bfloat16* m_out_bf16; };
-    union { float* v_out;   __nv_bfloat16* v_out_bf16; };
-    union { float* m_norm2; __nv_bfloat16* m_norm2_bf16; };
-    union { float* v_norm2; __nv_bfloat16* v_norm2_bf16; };
-    union { float* m_router;__nv_bfloat16* m_router_bf16; };
-    union { float* v_router;__nv_bfloat16* v_router_bf16; };
-    union { float* m_w1[4]; __nv_bfloat16* m_w1_bf16[4]; };
-    union { float* v_w1[4]; __nv_bfloat16* v_w1_bf16[4]; };
-    union { float* m_w2[4]; __nv_bfloat16* m_w2_bf16[4]; };
-    union { float* v_w2[4]; __nv_bfloat16* v_w2_bf16[4]; };
+    // AdamW momentum buffers (tri-precision: FP32, BF16, or FP8)
+    union { float* m_norm1; __nv_bfloat16* m_norm1_bf16; __nv_fp8_e4m3* m_norm1_fp8; };
+    union { float* v_norm1; __nv_bfloat16* v_norm1_bf16; __nv_fp8_e5m2* v_norm1_fp8; };
+    union { float* m_qkv;   __nv_bfloat16* m_qkv_bf16;   __nv_fp8_e4m3* m_qkv_fp8; };
+    union { float* v_qkv;   __nv_bfloat16* v_qkv_bf16;   __nv_fp8_e5m2* v_qkv_fp8; };
+    union { float* m_out;   __nv_bfloat16* m_out_bf16;   __nv_fp8_e4m3* m_out_fp8; };
+    union { float* v_out;   __nv_bfloat16* v_out_bf16;   __nv_fp8_e5m2* v_out_fp8; };
+    union { float* m_norm2; __nv_bfloat16* m_norm2_bf16; __nv_fp8_e4m3* m_norm2_fp8; };
+    union { float* v_norm2; __nv_bfloat16* v_norm2_bf16; __nv_fp8_e5m2* v_norm2_fp8; };
+    union { float* m_router;__nv_bfloat16* m_router_bf16;__nv_fp8_e4m3* m_router_fp8; };
+    union { float* v_router;__nv_bfloat16* v_router_bf16;__nv_fp8_e5m2* v_router_fp8; };
+    union { float* m_w1[4]; __nv_bfloat16* m_w1_bf16[4]; __nv_fp8_e4m3* m_w1_fp8[4]; };
+    union { float* v_w1[4]; __nv_bfloat16* v_w1_bf16[4]; __nv_fp8_e5m2* v_w1_fp8[4]; };
+    union { float* m_w2[4]; __nv_bfloat16* m_w2_bf16[4]; __nv_fp8_e4m3* m_w2_fp8[4]; };
+    union { float* v_w2[4]; __nv_bfloat16* v_w2_bf16[4]; __nv_fp8_e5m2* v_w2_fp8[4]; };
     float* m_gamma; float* v_gamma;
     float* m_var;   float* v_var;
 };
@@ -82,19 +83,19 @@ struct LayerWeights {
 struct FullModelParameters {
     __nv_bfloat16* tok_emb_weight;   // (vocab_size, C)
     __nv_bfloat16* d_tok_emb_weight; // (vocab_size, C)
-    union { float* m_tok_emb; __nv_bfloat16* m_tok_emb_bf16; };
-    union { float* v_tok_emb; __nv_bfloat16* v_tok_emb_bf16; };
+    union { float* m_tok_emb; __nv_bfloat16* m_tok_emb_bf16; __nv_fp8_e4m3* m_tok_emb_fp8; };
+    union { float* v_tok_emb; __nv_bfloat16* v_tok_emb_bf16; __nv_fp8_e5m2* v_tok_emb_fp8; };
     
     __nv_bfloat16* final_norm_weight;   // (C)
     __nv_bfloat16* d_final_norm_weight; // (C)
-    union { float* m_final_norm; __nv_bfloat16* m_final_norm_bf16; };
-    union { float* v_final_norm; __nv_bfloat16* v_final_norm_bf16; };
+    union { float* m_final_norm; __nv_bfloat16* m_final_norm_bf16; __nv_fp8_e4m3* m_final_norm_fp8; };
+    union { float* v_final_norm; __nv_bfloat16* v_final_norm_bf16; __nv_fp8_e5m2* v_final_norm_fp8; };
     
     __nv_bfloat16* lm_head_weight;   // (vocab_pad, C)
     __nv_fp8_e4m3* lm_head_weight_fp8; // (vocab_pad, C) FP8 E4M3
     __nv_bfloat16* d_lm_head_weight; // (vocab_pad, C)
-    union { float* m_lm_head; __nv_bfloat16* m_lm_head_bf16; };
-    union { float* v_lm_head; __nv_bfloat16* v_lm_head_bf16; };
+    union { float* m_lm_head; __nv_bfloat16* m_lm_head_bf16; __nv_fp8_e4m3* m_lm_head_fp8; };
+    union { float* v_lm_head; __nv_bfloat16* v_lm_head_bf16; __nv_fp8_e5m2* v_lm_head_fp8; };
     
     LayerWeights layers[24];
 };
