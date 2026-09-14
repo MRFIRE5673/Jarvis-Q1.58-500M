@@ -6,6 +6,7 @@
 #include "runtime.h"
 #include "optimizer.h"
 #include "cublaslt_engine.h"
+#include "attention.h"
 #include <cuda_fp8.h>
 
 void launch_quantize_bf16_to_fp8(
@@ -415,6 +416,79 @@ float train_step_graph() {
     return get_loss();
 }
 
+// Component 3: Isolated Attention Forward Test Binding
+torch::Tensor test_attention_forward(torch::Tensor layer_qkv, int layer_idx) {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    TORCH_CHECK(layer_idx >= 0 && layer_idx < g_cfg.num_layers, "Invalid layer index");
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    auto& lay = g_params.layers[layer_idx];
+    
+    cudaMemcpyAsync(g_ws.layer_qkv, layer_qkv.data_ptr(), g_cfg.M() * 3 * g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+    
+    const size_t attn_state_elements = (size_t)g_cfg.B * g_cfg.H * g_cfg.D * g_cfg.D;
+    cudaMemsetAsync(g_ws.layer_attn_state[layer_idx], 0, attn_state_elements * sizeof(__nv_bfloat16), stream);
+    
+    run_native_associative_attention_forward(g_ws, lay, layer_idx, g_cfg, stream);
+    cudaStreamSynchronize(stream);
+    
+    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    torch::Tensor out = torch::empty({g_cfg.M(), g_cfg.C}, opts);
+    cudaMemcpy(out.data_ptr(), g_ws.layer_attn_out, g_cfg.M() * g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    return out;
+}
+
+// Component 3: Isolated Attention Backward Test Binding
+std::vector<torch::Tensor> test_attention_backward(torch::Tensor d_attn_out, int layer_idx) {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    TORCH_CHECK(layer_idx >= 0 && layer_idx < g_cfg.num_layers, "Invalid layer index");
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    
+    auto& lay = g_params.layers[layer_idx];
+    const __nv_bfloat16* d_out_ptr = reinterpret_cast<const __nv_bfloat16*>(d_attn_out.data_ptr<at::BFloat16>());
+    
+    run_native_associative_attention_backward(g_ws, lay, layer_idx, g_cfg, d_out_ptr, 0.0f, stream);
+    cudaStreamSynchronize(stream);
+    
+    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    
+    // Copy d_layer_qkv (2048, 3072)
+    torch::Tensor d_qkv = torch::empty({g_cfg.M(), 3 * g_cfg.C}, opts);
+    cudaMemcpyAsync(d_qkv.data_ptr(), g_ws.d_layer_qkv, g_cfg.M() * 3 * g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+    
+    // dW_out (C, C)
+    torch::Tensor dW_out = torch::empty({g_cfg.C, g_cfg.C}, opts);
+    cudaMemcpyAsync(dW_out.data_ptr(), lay.d_out_proj_weight, g_cfg.C * g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+    
+    // dS_all (512, 64, 64)
+    torch::Tensor dS_all = torch::empty({g_cfg.B, g_cfg.H, g_cfg.T / g_cfg.chunk_size, g_cfg.D, g_cfg.D}, opts);
+    cudaMemcpyAsync(dS_all.data_ptr(), g_ws.attn_ds_all, g_cfg.B * g_cfg.H * (g_cfg.T / g_cfg.chunk_size) * g_cfg.D * g_cfg.D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+    
+    // dDeltaS (512, 64, 64)
+    torch::Tensor dDeltaS = torch::empty({g_cfg.B, g_cfg.H, g_cfg.T / g_cfg.chunk_size, g_cfg.D, g_cfg.D}, opts);
+    cudaMemcpyAsync(dDeltaS.data_ptr(), g_ws.attn_d_delta_s, g_cfg.B * g_cfg.H * (g_cfg.T / g_cfg.chunk_size) * g_cfg.D * g_cfg.D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+    
+    cudaStreamSynchronize(stream);
+    return {d_qkv, dW_out, dS_all, dDeltaS};
+}
+
+std::vector<torch::Tensor> get_layer_gradients(int layer_idx) {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    TORCH_CHECK(layer_idx >= 0 && layer_idx < g_cfg.num_layers, "Invalid layer index");
+    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    auto& lay = g_params.layers[layer_idx];
+    
+    torch::Tensor d_qkv = torch::empty({3 * g_cfg.C, g_cfg.C}, opts);
+    cudaMemcpy(d_qkv.data_ptr(), lay.d_qkv_weight, 3 * g_cfg.C * g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    
+    torch::Tensor d_out = torch::empty({g_cfg.C, g_cfg.C}, opts);
+    cudaMemcpy(d_out.data_ptr(), lay.d_out_proj_weight, g_cfg.C * g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    
+    torch::Tensor d_norm1 = torch::empty({g_cfg.C}, opts);
+    cudaMemcpy(d_norm1.data_ptr(), lay.d_norm1_weight, g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    
+    return {d_qkv, d_out, d_norm1};
+}
+
 // ---------------------------------------------------------------------------
 // PyBind11 Module Exports
 // ---------------------------------------------------------------------------
@@ -458,5 +532,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_fused_rmsnorm_quant", []() { return g_cfg.use_fused_rmsnorm_quant; }, "Phase 31: Query native fused RMSNorm + FP8 quant status");
     m.def("set_fp8_qkv_backward", [](bool enabled) { g_cfg.use_fp8_qkv_backward = enabled; }, "Phase 31: Toggle native FP8 QKV backward execution");
     m.def("get_fp8_qkv_backward", []() { return g_cfg.use_fp8_qkv_backward; }, "Phase 31: Query native FP8 QKV backward status");
+    m.def("test_attention_backward", &test_attention_backward, "Component 3: Test native attention backward");
+    m.def("test_attention_forward", &test_attention_forward, "Component 3: Test native attention forward");
+    m.def("get_layer_gradients", &get_layer_gradients, "Component 3: Get layer parameter gradients");
 }
 

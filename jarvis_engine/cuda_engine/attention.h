@@ -27,3 +27,14 @@ void run_native_associative_attention_forward(
     const FullJarvisConfig& cfg,
     cudaStream_t stream
 );
+
+// Run the full native associative attention backward pipeline for one layer
+void run_native_associative_attention_backward(
+    FullModelWorkspace& ws,
+    LayerWeights& lay,
+    int layer_idx,
+    const FullJarvisConfig& cfg,
+    const __nv_bfloat16* d_layer_attn_out,
+    float beta_dw,
+    cudaStream_t stream
+);

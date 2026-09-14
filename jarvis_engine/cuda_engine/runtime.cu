@@ -146,6 +146,22 @@ FullModelWorkspace allocate_full_workspace(const FullJarvisConfig& cfg) {
         cudaMemset(ws.layer_attn_state[l], 0, attn_state_elements * sizeof(__nv_bfloat16));
     }
     
+    // 3c. Native Associative Linear Attention Backward Buffers
+    alloc_bf16(ws.attn_d_raw_cross, chunk_mat_elements);
+    alloc_bf16(ws.attn_dq_cross, chunk_mat_elements);
+    alloc_bf16(ws.attn_ds_all, chunk_mat_elements);
+    alloc_bf16(ws.attn_d_delta_s, chunk_mat_elements);
+    alloc_bf16(ws.attn_dk_delta, chunk_mat_elements);
+    alloc_bf16(ws.attn_dv_w, chunk_mat_elements);
+    alloc_bf16(ws.attn_d_scores, chunk_mat_elements);
+    alloc_bf16(ws.attn_dv_intra, chunk_mat_elements);
+    alloc_bf16(ws.attn_dq_intra, chunk_mat_elements);
+    alloc_bf16(ws.attn_dk_intra, chunk_mat_elements);
+    alloc_bf16(ws.attn_d_context, M * C);
+    alloc_bf16(ws.d_layer_qkv, M * 3 * C);
+    alloc_bf16(ws.dx_norm1, M * C);
+    alloc_bf16(ws.dx_norm1_in, M * C);
+    
     // Initialize static rotary position embedding tables
     init_attention_rotary_tables(ws, cfg, 0);
     cudaDeviceSynchronize();
@@ -264,6 +280,21 @@ void free_full_workspace(FullModelWorkspace& ws) {
     for (int l = 0; l < 24; ++l) {
         free_p((void*&)ws.layer_attn_state[l]);
     }
+    
+    free_p((void*&)ws.attn_d_raw_cross);
+    free_p((void*&)ws.attn_dq_cross);
+    free_p((void*&)ws.attn_ds_all);
+    free_p((void*&)ws.attn_d_delta_s);
+    free_p((void*&)ws.attn_dk_delta);
+    free_p((void*&)ws.attn_dv_w);
+    free_p((void*&)ws.attn_d_scores);
+    free_p((void*&)ws.attn_dv_intra);
+    free_p((void*&)ws.attn_dq_intra);
+    free_p((void*&)ws.attn_dk_intra);
+    free_p((void*&)ws.attn_d_context);
+    free_p((void*&)ws.d_layer_qkv);
+    free_p((void*&)ws.dx_norm1);
+    free_p((void*&)ws.dx_norm1_in);
     
     free_p((void*&)ws.loss_buffer);
     free_p((void*&)ws.l_bal_total);

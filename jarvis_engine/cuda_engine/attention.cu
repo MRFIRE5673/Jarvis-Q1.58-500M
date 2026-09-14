@@ -258,6 +258,182 @@ __global__ void combine_intra_cross_kernel(
     attn_context[m * 1024 + c] = __float2bfloat16(total);
 }
 
+// ---------------------------------------------------------------------------
+// 7. Context Unpack Kernel: d_attn_context -> d_intra_out and d_raw_cross
+// ---------------------------------------------------------------------------
+__global__ void unpack_d_attn_context_kernel(
+    const __nv_bfloat16* __restrict__ d_attn_context, // (M, C) = (2048, 1024)
+    const __nv_bfloat16* __restrict__ gamma_cross,   // (H, cs) = (16, 64)
+    __nv_bfloat16* __restrict__ d_intra_out,         // (512, 64, 64)
+    __nv_bfloat16* __restrict__ d_raw_cross,         // (512, 64, 64)
+    int total_elements                               // 2,097,152
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+    
+    int d = idx % 64;
+    int rem1 = idx / 64;
+    int i = rem1 % 64;
+    int rem2 = rem1 / 64;
+    int k = rem2 % 8;
+    int rem3 = rem2 / 8;
+    int h = rem3 % 16;
+    int b = rem3 / 16;
+    
+    int m = (b * 8 + k) * 64 + i;
+    int c = h * 64 + d;
+    
+    float d_ctx = __bfloat162float(d_attn_context[m * 1024 + c]);
+    float gc = __bfloat162float(gamma_cross[h * 64 + i]);
+    
+    d_intra_out[idx] = __float2bfloat16(d_ctx);
+    d_raw_cross[idx] = __float2bfloat16(d_ctx * gc);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Recurrent Chunk State Scan Backward Kernel (FP32 Accumulation)
+// ---------------------------------------------------------------------------
+__global__ void recurrent_chunk_state_scan_backward_kernel(
+    const __nv_bfloat16* __restrict__ grad_all_states, // (B, H, Nc, D, D) = ds_all
+    const __nv_bfloat16* __restrict__ grad_h_last,     // (B, H, D, D) or nullptr
+    const __nv_bfloat16* __restrict__ all_states,      // (B, H, Nc, D, D)
+    const float* __restrict__ gamma_c_tab,             // (H,)
+    __nv_bfloat16* __restrict__ grad_delta_S,          // (B, H, Nc, D, D) = d_delta_s
+    __nv_bfloat16* __restrict__ grad_h_prev,           // (B, H, D, D) or nullptr
+    int B, int H, int Nc, int D
+) {
+    int bh_idx = blockIdx.x; // [0, B * H - 1]
+    if (bh_idx >= B * H) return;
+    
+    int b = bh_idx / H;
+    int h = bh_idx % H;
+    float gamma_c = gamma_c_tab[h];
+    
+    int state_size = D * D;
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    
+    for (int elem_idx = tid; elem_idx < state_size; elem_idx += num_threads) {
+        float grad_s = 0.0f;
+        if (grad_h_last != nullptr) {
+            int last_offset = (b * H + h) * state_size + elem_idx;
+            grad_s = __bfloat162float(grad_h_last[last_offset]);
+        }
+        
+        // Reverse scan from chunk Nc - 1 down to 0
+        for (int k = Nc - 1; k >= 0; --k) {
+            int offset = ((b * H + h) * Nc + k) * state_size + elem_idx;
+            
+            // grad_delta_S[k] = grad_s (since S_{k+1} = gamma_c * S_k + delta_S_k)
+            grad_delta_S[offset] = __float2bfloat16(grad_s);
+            
+            // Backward propagation to S_k:
+            // S_k contributes to S_{k+1} via (gamma_c * S_k) and to all_states[k] directly (grad_all_states[k])
+            float direct_grad = __bfloat162float(grad_all_states[offset]);
+            grad_s = direct_grad + gamma_c * grad_s;
+        }
+        
+        if (grad_h_prev != nullptr) {
+            int prev_offset = (b * H + h) * state_size + elem_idx;
+            grad_h_prev[prev_offset] = __float2bfloat16(grad_s);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 9. Fused Combination + RoPE + ELU+1 + Q-scale + Vw Backward Kernel
+// ---------------------------------------------------------------------------
+__global__ void fused_combine_rope_elu_bwd_kernel(
+    const __nv_bfloat16* __restrict__ dq_intra,   // (512, 64, 64)
+    const __nv_bfloat16* __restrict__ dq_cross,   // (512, 64, 64)
+    const __nv_bfloat16* __restrict__ dk_intra,   // (512, 64, 64)
+    const __nv_bfloat16* __restrict__ dk_delta,   // (512, 64, 64)
+    const __nv_bfloat16* __restrict__ dv_intra,   // (512, 64, 64)
+    const __nv_bfloat16* __restrict__ dv_w,       // (512, 64, 64)
+    const __nv_bfloat16* __restrict__ gw_tab,     // (H, cs) = (16, 64)
+    const __nv_bfloat16* __restrict__ layer_qkv,  // (M, 3 * C) = (2048, 3072)
+    const __nv_bfloat16* __restrict__ cos_tab,    // (T, D) = (512, 64)
+    const __nv_bfloat16* __restrict__ sin_tab,    // (T, D) = (512, 64)
+    __nv_bfloat16* __restrict__ d_layer_qkv,      // (M, 3 * C) = (2048, 3072)
+    int total_pairs                               // 1,048,576
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_pairs) return;
+    
+    int d = idx % 32;
+    int rem1 = idx / 32;
+    int t = rem1 % 512;
+    int rem2 = rem1 / 512;
+    int h = rem2 % 16;
+    int b = rem2 / 16;
+    
+    int k = t / 64; // chunk index [0, 7]
+    int i = t % 64; // local index in chunk [0, 63]
+    
+    int m = b * 512 + t;
+    int base_q1 = m * 3072 + h * 64 + d;
+    int base_q2 = base_q1 + 32;
+    int base_k1 = base_q1 + 1024;
+    int base_k2 = base_q2 + 1024;
+    int base_v1 = base_q1 + 2048;
+    int base_v2 = base_q2 + 2048;
+    
+    int chunk_idx = (b * 16 + h) * 8 + k;
+    int out_offset1 = (chunk_idx * 64 + i) * 64 + d;
+    int out_offset2 = out_offset1 + 32;
+    
+    // 1. Gather upstream chunk grads
+    float dq1_rot = __bfloat162float(dq_intra[out_offset1]) + __bfloat162float(dq_cross[out_offset1]);
+    float dq2_rot = __bfloat162float(dq_intra[out_offset2]) + __bfloat162float(dq_cross[out_offset2]);
+    
+    float dk1_rot = __bfloat162float(dk_intra[out_offset1]) + __bfloat162float(dk_delta[out_offset1]);
+    float dk2_rot = __bfloat162float(dk_intra[out_offset2]) + __bfloat162float(dk_delta[out_offset2]);
+    
+    float gw = __bfloat162float(gw_tab[h * 64 + i]);
+    float dv1 = __bfloat162float(dv_intra[out_offset1]) + __bfloat162float(dv_w[out_offset1]) * gw;
+    float dv2 = __bfloat162float(dv_intra[out_offset2]) + __bfloat162float(dv_w[out_offset2]) * gw;
+    
+    // 2. Rotary & ELU+1 tables and raw values
+    float c1 = __bfloat162float(cos_tab[t * 64 + d]);
+    float s1 = __bfloat162float(sin_tab[t * 64 + d]);
+    float c2 = __bfloat162float(cos_tab[t * 64 + d + 32]);
+    float s2 = __bfloat162float(sin_tab[t * 64 + d + 32]);
+    
+    float q1_raw = __bfloat162float(layer_qkv[base_q1]);
+    float q2_raw = __bfloat162float(layer_qkv[base_q2]);
+    float k1_raw = __bfloat162float(layer_qkv[base_k1]);
+    float k2_raw = __bfloat162float(layer_qkv[base_k2]);
+    
+    // 3. RoPE backward:
+    // q_rot1 = q1 * c1 - q2 * s1
+    // q_rot2 = q2 * c2 + q1 * s2
+    // dL/dq1 = gq1 * c1 + gq2 * s2
+    // dL/dq2 = -gq1 * s1 + gq2 * c2
+    float dL_dq1 = dq1_rot * c1 + dq2_rot * s2;
+    float dL_dq2 = -dq1_rot * s1 + dq2_rot * c2;
+    float dL_dk1 = dk1_rot * c1 + dk2_rot * s2;
+    float dL_dk2 = -dk1_rot * s1 + dk2_rot * c2;
+    
+    // 4. ELU+1 backward & Q scaling (0.125f)
+    float d_elu_q1 = (q1_raw > 0.0f) ? 1.0f : expf(q1_raw);
+    float d_elu_q2 = (q2_raw > 0.0f) ? 1.0f : expf(q2_raw);
+    float d_elu_k1 = (k1_raw > 0.0f) ? 1.0f : expf(k1_raw);
+    float d_elu_k2 = (k2_raw > 0.0f) ? 1.0f : expf(k2_raw);
+    
+    float dq1_in = dL_dq1 * 0.125f * d_elu_q1;
+    float dq2_in = dL_dq2 * 0.125f * d_elu_q2;
+    float dk1_in = dL_dk1 * d_elu_k1;
+    float dk2_in = dL_dk2 * d_elu_k2;
+    
+    // 5. Write distinct, independent dQ, dK, dV gradients into d_layer_qkv
+    d_layer_qkv[base_q1] = __float2bfloat16(dq1_in);
+    d_layer_qkv[base_q2] = __float2bfloat16(dq2_in);
+    d_layer_qkv[base_k1] = __float2bfloat16(dk1_in);
+    d_layer_qkv[base_k2] = __float2bfloat16(dk2_in);
+    d_layer_qkv[base_v1] = __float2bfloat16(dv1);
+    d_layer_qkv[base_v2] = __float2bfloat16(dv2);
+}
+
 } // anonymous namespace
 
 // ===========================================================================
@@ -401,3 +577,213 @@ void run_native_associative_attention_forward(
         cfg.M(), cfg.C, stream
     );
 }
+
+void run_native_associative_attention_backward(
+    FullModelWorkspace& ws,
+    LayerWeights& lay,
+    int layer_idx,
+    const FullJarvisConfig& cfg,
+    const __nv_bfloat16* d_layer_attn_out,
+    float beta_dw,
+    cudaStream_t stream
+) {
+    cublasHandle_t handle = get_cublas_handle();
+    cublasSetStream(handle, stream);
+    
+    float alpha = 1.0f;
+    float beta_zero = 0.0f;
+    int M = cfg.M(); // 2048
+    int C = cfg.C;   // 1024
+    
+    // 1. Attention Output Projection Backward:
+    // 1a. dW_out += d_layer_attn_out^T @ ws.layer_attn_context (1024, 1024)
+    cublasGemmEx(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        C, C, M,
+        &alpha,
+        ws.layer_attn_context, CUDA_R_16BF, C,
+        d_layer_attn_out, CUDA_R_16BF, C,
+        &beta_dw,
+        lay.d_out_proj_weight, CUDA_R_16BF, C,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    
+    // 1b. d_attn_context = d_layer_attn_out @ W_out (2048, 1024)
+    cublasGemmEx(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        C, M, C,
+        &alpha,
+        lay.out_proj_weight, CUDA_R_16BF, C,
+        d_layer_attn_out, CUDA_R_16BF, C,
+        &beta_zero,
+        ws.attn_d_context, CUDA_R_16BF, C,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    
+    // 2. Unpack d_attn_context into d_intra_out and d_raw_cross
+    int batch_count = cfg.B * cfg.H * (cfg.T / cfg.chunk_size); // 512
+    int cs = cfg.chunk_size; // 64
+    int D = cfg.D;           // 64
+    long long int stride_mat = cs * D; // 4096
+    int total_elements = batch_count * stride_mat; // 2,097,152
+    
+    unpack_d_attn_context_kernel<<<(total_elements + 255) / 256, 256, 0, stream>>>(
+        ws.attn_d_context, ws.gamma_cross_tab,
+        ws.attn_intra_out, // reuse attn_intra_out as d_intra_out buffer
+        ws.attn_d_raw_cross,
+        total_elements
+    );
+    
+    // 3. Batched GEMMs: Cross-chunk contraction backward
+    // 3a. dQ_cross = dRawCross @ S_all: (512, cs, D) @ (512, D, D) -> (512, cs, D)
+    cublasGemmStridedBatchedEx(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        D, cs, D,
+        &alpha,
+        ws.attn_all_states, CUDA_R_16BF, D, stride_mat,
+        ws.attn_d_raw_cross, CUDA_R_16BF, D, stride_mat,
+        &beta_zero,
+        ws.attn_dq_cross, CUDA_R_16BF, D, stride_mat,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    
+    // 3b. dS_all = dRawCross^T @ Q: (512, D, cs) @ (512, cs, D) -> (512, D, D)
+    cublasGemmStridedBatchedEx(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        D, D, cs,
+        &alpha,
+        ws.attn_q_chunks, CUDA_R_16BF, D, stride_mat,
+        ws.attn_d_raw_cross, CUDA_R_16BF, D, stride_mat,
+        &beta_zero,
+        ws.attn_ds_all, CUDA_R_16BF, D, stride_mat,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    
+    // 4. Recurrent Chunk State Scan Backward (propagate dS_all -> d_delta_s)
+    recurrent_chunk_state_scan_backward_kernel<<<cfg.B * cfg.H, 256, 0, stream>>>(
+        ws.attn_ds_all, nullptr, ws.attn_all_states, ws.gamma_c_tab,
+        ws.attn_d_delta_s, nullptr,
+        cfg.B, cfg.H, cfg.T / cfg.chunk_size, cfg.D
+    );
+    
+    // 5. Batched GEMMs: Chunk Delta S backward
+    // 5a. dK_delta = V_w @ d_delta_S: (512, cs, D) @ (512, D, D) -> (512, cs, D)
+    cublasGemmStridedBatchedEx(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        D, cs, D,
+        &alpha,
+        ws.attn_d_delta_s, CUDA_R_16BF, D, stride_mat,
+        ws.attn_v_w_chunks, CUDA_R_16BF, D, stride_mat,
+        &beta_zero,
+        ws.attn_dk_delta, CUDA_R_16BF, D, stride_mat,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    
+    // 5b. dV_w = K @ d_delta_S^T: (512, cs, D) @ (512, D, D) -> (512, cs, D)
+    cublasGemmStridedBatchedEx(
+        handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        D, cs, D,
+        &alpha,
+        ws.attn_d_delta_s, CUDA_R_16BF, D, stride_mat,
+        ws.attn_k_chunks, CUDA_R_16BF, D, stride_mat,
+        &beta_zero,
+        ws.attn_dv_w, CUDA_R_16BF, D, stride_mat,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    
+    // 6. Batched GEMMs: Intra-chunk attention backward
+    // 6a. dScores = d_intra @ V^T: (512, cs, D) @ (512, D, cs) -> (512, cs, cs)
+    cublasGemmStridedBatchedEx(
+        handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        cs, cs, D,
+        &alpha,
+        ws.attn_v_chunks, CUDA_R_16BF, D, stride_mat,
+        ws.attn_intra_out, CUDA_R_16BF, D, stride_mat,
+        &beta_zero,
+        ws.attn_d_scores, CUDA_R_16BF, cs, stride_mat,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    
+    // 6b. dV_intra = Scores^T @ d_intra: (512, cs, cs) @ (512, cs, D) -> (512, cs, D)
+    cublasGemmStridedBatchedEx(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        D, cs, cs,
+        &alpha,
+        ws.attn_intra_out, CUDA_R_16BF, D, stride_mat,
+        ws.attn_scores, CUDA_R_16BF, cs, stride_mat,
+        &beta_zero,
+        ws.attn_dv_intra, CUDA_R_16BF, D, stride_mat,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    
+    // 6c. Causal decay backward: dRawScores = dScores * decay_mat (in-place)
+    apply_causal_decay_kernel<<<(total_elements + 255) / 256, 256, 0, stream>>>(
+        ws.attn_d_scores, ws.decay_mat_tab, total_elements
+    );
+    
+    // 6d. dQ_intra = dRawScores @ K: (512, cs, cs) @ (512, cs, D) -> (512, cs, D)
+    cublasGemmStridedBatchedEx(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        D, cs, cs,
+        &alpha,
+        ws.attn_k_chunks, CUDA_R_16BF, D, stride_mat,
+        ws.attn_d_scores, CUDA_R_16BF, cs, stride_mat,
+        &beta_zero,
+        ws.attn_dq_intra, CUDA_R_16BF, D, stride_mat,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    
+    // 6e. dK_intra = dRawScores^T @ Q: (512, cs, cs) @ (512, cs, D) -> (512, cs, D)
+    cublasGemmStridedBatchedEx(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        D, cs, cs,
+        &alpha,
+        ws.attn_q_chunks, CUDA_R_16BF, D, stride_mat,
+        ws.attn_d_scores, CUDA_R_16BF, cs, stride_mat,
+        &beta_zero,
+        ws.attn_dk_intra, CUDA_R_16BF, D, stride_mat,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    
+    // 7. Fused Combination + RoPE + ELU+1 + Q-scale + Vw Backward -> ws.d_layer_qkv (2048, 3072)
+    int total_pairs = cfg.B * cfg.H * cfg.T * (cfg.D / 2); // 1,048,576
+    int block_size = 256;
+    int grid_size = (total_pairs + block_size - 1) / block_size;
+    fused_combine_rope_elu_bwd_kernel<<<grid_size, block_size, 0, stream>>>(
+        ws.attn_dq_intra, ws.attn_dq_cross,
+        ws.attn_dk_intra, ws.attn_dk_delta,
+        ws.attn_dv_intra, ws.attn_dv_w, ws.gw_tab,
+        ws.layer_qkv, ws.cos_tab, ws.sin_tab,
+        ws.d_layer_qkv,
+        total_pairs
+    );
+}
+

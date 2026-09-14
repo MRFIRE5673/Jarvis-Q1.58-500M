@@ -313,26 +313,63 @@ void run_full_model_backward(
     for (int l = cfg.num_layers - 1; l >= 0; --l) {
         auto& lay = params.layers[l];
         
-        // Residual 2 backward: dX2 splits into dX1 and dMoeOut
-        float scale_dx = 128.0f;
-        float scale_x = 16.0f;
-        float alpha_dw = 1.0f / (scale_x * scale_dx);
+        // 1. Recompute forward activations for Layer l
+        launch_fused_rmsnorm_fwd(
+            ws.stashed_x[l], lay.norm1_weight, ws.layer_x_norm1, ws.layer_rsqrt1,
+            M, C, 1e-6f, stream
+        );
+        cublaslt_gemm_qkv_fwd(ws.layer_x_norm1, lay.qkv_weight, ws.layer_qkv, M, C, stream);
+        run_native_associative_attention_forward(ws, lay, l, cfg, stream);
         
-        if (cfg.use_fp8_qkv_backward) {
-            launch_fused_rmsnorm_bwd(
-                cur_dx, ws.stashed_x[l], lay.norm1_weight,
-                ws.layer_rsqrt1, next_dx, lay.d_norm1_weight, M, C, stream,
-                ws.d_layer_x_fp8, scale_dx
-            );
-            cublaslt_gemm_qkv_bwd_dw_slice_fp8(ws.d_layer_x_fp8, ws.stashed_x_fp8[l], lay.d_qkv_weight, M, C, alpha_dw, beta, stream);
-        } else {
-            launch_fused_rmsnorm_bwd(
-                cur_dx, ws.stashed_x[l], lay.norm1_weight,
-                ws.layer_rsqrt1, next_dx, lay.d_norm1_weight, M, C, stream
-            );
-            cublaslt_gemm_qkv_bwd_dw_slice(next_dx, ws.stashed_x[l], lay.d_qkv_weight, M, C, stream, beta);
-        }
-        replicate_qkv_dw_slices(lay.d_qkv_weight, C, stream);
+        // 2. Analytical Associative Attention Backward:
+        // Computes dW_out (accumulating into lay.d_out_proj_weight with beta)
+        // and d_layer_qkv (M, 3 * C) with distinct dQ, dK, dV
+        run_native_associative_attention_backward(
+            ws, lay, l, cfg, cur_dx, beta, stream
+        );
+        
+        // 3. QKV Projection Backward GEMMs:
+        // 3a. dW_qkv += (d_layer_qkv)^T @ layer_x_norm1 (3 * C, C)
+        cublasHandle_t handle = get_cublas_handle();
+        cublasSetStream(handle, stream);
+        float alpha = 1.0f, beta_zero = 0.0f;
+        cublasGemmEx(
+            handle,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            C, 3 * C, M,
+            &alpha,
+            ws.layer_x_norm1, CUDA_R_16BF, C,
+            ws.d_layer_qkv, CUDA_R_16BF, 3 * C,
+            &beta,
+            lay.d_qkv_weight, CUDA_R_16BF, C,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT
+        );
+        
+        // 3b. dx_norm1 = d_layer_qkv @ W_qkv (M, C)
+        cublasGemmEx(
+            handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            C, M, 3 * C,
+            &alpha,
+            lay.qkv_weight, CUDA_R_16BF, C,
+            ws.d_layer_qkv, CUDA_R_16BF, 3 * C,
+            &beta_zero,
+            ws.dx_norm1, CUDA_R_16BF, C,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT
+        );
+        
+        // 4. RMSNorm 1 Backward:
+        // Propagate dx_norm1 through RMSNorm 1 -> dx_norm1_in and accumulate lay.d_norm1_weight
+        launch_fused_rmsnorm_bwd(
+            ws.dx_norm1, ws.stashed_x[l], lay.norm1_weight,
+            ws.layer_rsqrt1, ws.dx_norm1_in, lay.d_norm1_weight, M, C, stream
+        );
+        
+        // 5. Residual 1 Addition:
+        // next_dx = cur_dx + dx_norm1_in
+        launch_fused_add_residual(cur_dx, ws.dx_norm1_in, next_dx, M * C, stream);
         
         // Zero-overhead ping-pong gradient pointer swap (eliminates cudaMemcpyAsync)
         std::swap(cur_dx, next_dx);
@@ -601,34 +638,71 @@ void run_interleaved_backward(
     for (int l = cfg.num_layers - 1; l >= 0; --l) {
         auto& lay = params.layers[l];
         
-        float scale_dx = 128.0f;
-        float scale_x = 16.0f;
-        float alpha_dw = 1.0f / (scale_x * scale_dx);
-        
         // Interleave MS0 then MS1: both accumulate into the same layer parameter buffers
         for (int ms = 0; ms < 2; ++ms) {
-            float beta_qkv = (ms == 0 ? 0.0f : 1.0f);
-            if (cfg.use_fp8_qkv_backward) {
-                launch_fused_rmsnorm_bwd(
-                    cur_dx[ms], ws.stashed_x_ms[ms][l], lay.norm1_weight,
-                    ws.layer_rsqrt1, next_dx[ms], lay.d_norm1_weight, M, C, stream,
-                    ws.d_layer_x_fp8_ms[ms], scale_dx
-                );
-                cublaslt_gemm_qkv_bwd_dw_slice_fp8(ws.d_layer_x_fp8_ms[ms], ws.stashed_x_fp8_ms[ms][l], lay.d_qkv_weight, M, C, alpha_dw, beta_qkv, stream);
-            } else {
-                launch_fused_rmsnorm_bwd(
-                    cur_dx[ms], ws.stashed_x_ms[ms][l], lay.norm1_weight,
-                    ws.layer_rsqrt1, next_dx[ms], lay.d_norm1_weight, M, C, stream
-                );
-                cublaslt_gemm_qkv_bwd_dw_slice(next_dx[ms], ws.stashed_x_ms[ms][l], lay.d_qkv_weight, M, C, stream, beta_qkv);
-            }
+            float beta_layer = (ms == 0 ? 0.0f : 1.0f);
+            
+            // 1. Recompute forward activations for Layer l, Microstep ms
+            launch_fused_rmsnorm_fwd(
+                ws.stashed_x_ms[ms][l], lay.norm1_weight, ws.layer_x_norm1, ws.layer_rsqrt1,
+                M, C, 1e-6f, stream
+            );
+            cublaslt_gemm_qkv_fwd(ws.layer_x_norm1, lay.qkv_weight, ws.layer_qkv, M, C, stream);
+            run_native_associative_attention_forward(ws, lay, l, cfg, stream);
+            
+            // 2. Analytical Associative Attention Backward:
+            // Computes dW_out (accumulating into lay.d_out_proj_weight with beta_layer)
+            // and d_layer_qkv (M, 3 * C) with distinct dQ, dK, dV
+            run_native_associative_attention_backward(
+                ws, lay, l, cfg, cur_dx[ms], beta_layer, stream
+            );
+            
+            // 3. QKV Projection Backward GEMMs:
+            // 3a. dW_qkv += (d_layer_qkv)^T @ layer_x_norm1 (3 * C, C)
+            cublasHandle_t handle = get_cublas_handle();
+            cublasSetStream(handle, stream);
+            float alpha = 1.0f, beta_zero = 0.0f;
+            cublasGemmEx(
+                handle,
+                CUBLAS_OP_N, CUBLAS_OP_T,
+                C, 3 * C, M,
+                &alpha,
+                ws.layer_x_norm1, CUDA_R_16BF, C,
+                ws.d_layer_qkv, CUDA_R_16BF, 3 * C,
+                &beta_layer,
+                lay.d_qkv_weight, CUDA_R_16BF, C,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT
+            );
+            
+            // 3b. dx_norm1 = d_layer_qkv @ W_qkv (M, C)
+            cublasGemmEx(
+                handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                C, M, 3 * C,
+                &alpha,
+                lay.qkv_weight, CUDA_R_16BF, C,
+                ws.d_layer_qkv, CUDA_R_16BF, 3 * C,
+                &beta_zero,
+                ws.dx_norm1, CUDA_R_16BF, C,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT
+            );
+            
+            // 4. RMSNorm 1 Backward:
+            // Propagate dx_norm1 through RMSNorm 1 -> dx_norm1_in and accumulate lay.d_norm1_weight
+            launch_fused_rmsnorm_bwd(
+                ws.dx_norm1, ws.stashed_x_ms[ms][l], lay.norm1_weight,
+                ws.layer_rsqrt1, ws.dx_norm1_in, lay.d_norm1_weight, M, C, stream
+            );
+            
+            // 5. Residual 1 Addition:
+            // next_dx[ms] = cur_dx[ms] + dx_norm1_in
+            launch_fused_add_residual(cur_dx[ms], ws.dx_norm1_in, next_dx[ms], M * C, stream);
             
             // Zero-overhead ping-pong gradient pointer swap (eliminates cudaMemcpyAsync)
             std::swap(cur_dx[ms], next_dx[ms]);
         }
-        
-        // Replicate slice 0 (accumulated across both microsteps) to slice 1 and slice 2
-        replicate_qkv_dw_slices(lay.d_qkv_weight, C, stream);
         
         // Asynchronously accumulate layer l's completed gradients into ||g||^2
         launch_accumulate_layer_grad_norm_sq(lay, ws.grad_norm_sq, cfg, stream);

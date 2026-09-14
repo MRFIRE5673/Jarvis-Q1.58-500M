@@ -159,6 +159,22 @@ struct FullModelWorkspace {
     float*         gamma_c_tab;        // (H) in FP32
     __nv_bfloat16* layer_attn_state[24]; // (B, H, D, D) per layer recurrent state
     
+    // 3c. Native Associative Linear Attention Backward Buffers
+    __nv_bfloat16* attn_d_raw_cross;   // (512, 64, 64) in BF16
+    __nv_bfloat16* attn_dq_cross;      // (512, 64, 64) in BF16
+    __nv_bfloat16* attn_ds_all;        // (512, 64, 64) in BF16
+    __nv_bfloat16* attn_d_delta_s;     // (512, 64, 64) in BF16
+    __nv_bfloat16* attn_dk_delta;      // (512, 64, 64) in BF16
+    __nv_bfloat16* attn_dv_w;          // (512, 64, 64) in BF16
+    __nv_bfloat16* attn_d_scores;      // (512, 64, 64) in BF16
+    __nv_bfloat16* attn_dv_intra;      // (512, 64, 64) in BF16
+    __nv_bfloat16* attn_dq_intra;      // (512, 64, 64) in BF16
+    __nv_bfloat16* attn_dk_intra;      // (512, 64, 64) in BF16
+    __nv_bfloat16* attn_d_context;     // (M, C) in BF16
+    __nv_bfloat16* d_layer_qkv;        // (M, 3 * C) in BF16
+    __nv_bfloat16* dx_norm1;           // (M, C) in BF16
+    __nv_bfloat16* dx_norm1_in;        // (M, C) in BF16
+    
     // 4. Output & Loss Buffers
     __nv_bfloat16* final_norm_out;   // (M, C)
     __nv_fp8_e4m3* final_norm_out_fp8; // (M, C) FP8 E4M3
