@@ -1,12 +1,18 @@
 #include "cublaslt_engine.h"
 #include <cublasLt.h>
+#include <cublas_v2.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 static cublasLtHandle_t g_lt = nullptr;
+static cublasHandle_t g_cublas = nullptr;
 static void* g_ws = nullptr;
 static size_t g_ws_size = 32 * 1024 * 1024; // 32 MiB static workspace
 static bool g_initialized = false;
+
+cublasHandle_t get_cublas_handle() {
+    return g_cublas;
+}
 
 // Pre-configured operation descriptors
 static cublasLtMatmulDesc_t g_desc_nt = nullptr;
@@ -170,6 +176,7 @@ void init_cublaslt_engine(size_t workspace_bytes) {
     
     g_ws_size = workspace_bytes;
     cublasLtCreate(&g_lt);
+    cublasCreate(&g_cublas);
     cudaMalloc(&g_ws, g_ws_size);
     
     cublasOperation_t opT = CUBLAS_OP_T, opN = CUBLAS_OP_N;
@@ -212,9 +219,9 @@ void init_cublaslt_engine(size_t workspace_bytes) {
     g_algo_qkv_fwd = autotune_matmul_algo(g_lt, g_desc_nt, g_layout_w_qkv, g_layout_x_2048_1024, g_layout_out_qkv, g_layout_out_qkv, pref, d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "QKV Fwd", 1);
     
     // B. Attn Out Forward: C (2048 x 1024) = A (2048 x 1024) * B^T (1024 x 1024).T
-    // Q chunk is sliced from (2048, 3072), so its leading dimension is 3072!
+    // Attn context tensor has shape (2048, 1024), leading dimension is 1024
     cublasLtMatrixLayoutCreate(&g_layout_w_attn_out, CUDA_R_16BF, 1024, 1024, 1024);
-    cublasLtMatrixLayoutCreate(&g_layout_q_chunk, CUDA_R_16BF, 1024, 2048, 3072);
+    cublasLtMatrixLayoutCreate(&g_layout_q_chunk, CUDA_R_16BF, 1024, 2048, 1024);
     cublasLtMatrixLayoutCreate(&g_layout_out_attn, CUDA_R_16BF, 1024, 2048, 1024);
     g_algo_attn_out_fwd = autotune_matmul_algo(g_lt, g_desc_nt, g_layout_w_attn_out, g_layout_q_chunk, g_layout_out_attn, g_layout_out_attn, pref, d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "Attn Out Fwd", 0);
     
@@ -381,6 +388,10 @@ void cleanup_cublaslt_engine() {
     if (g_lt) {
         cublasLtDestroy(g_lt);
         g_lt = nullptr;
+    }
+    if (g_cublas) {
+        cublasDestroy(g_cublas);
+        g_cublas = nullptr;
     }
     g_initialized = false;
 }

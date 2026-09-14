@@ -1,4 +1,5 @@
 #include "runtime.h"
+#include "attention.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -119,6 +120,36 @@ FullModelWorkspace allocate_full_workspace(const FullJarvisConfig& cfg) {
     alloc_bf16(ws.layer_h_out, M * C);
     alloc_bf16(ws.layer_x2, M * C);
     
+    // 3b. Native Associative Linear Attention Buffers
+    const size_t chunk_mat_elements = (size_t)cfg.B * cfg.H * (cfg.T / cfg.chunk_size) * cfg.chunk_size * cfg.D;
+    alloc_bf16(ws.attn_q_chunks, chunk_mat_elements);
+    alloc_bf16(ws.attn_k_chunks, chunk_mat_elements);
+    alloc_bf16(ws.attn_v_chunks, chunk_mat_elements);
+    alloc_bf16(ws.attn_v_w_chunks, chunk_mat_elements);
+    alloc_bf16(ws.attn_scores, chunk_mat_elements);
+    alloc_bf16(ws.attn_intra_out, chunk_mat_elements);
+    alloc_bf16(ws.attn_delta_s, chunk_mat_elements);
+    alloc_bf16(ws.attn_all_states, chunk_mat_elements);
+    alloc_bf16(ws.attn_cross_out, chunk_mat_elements);
+    alloc_bf16(ws.layer_attn_context, M * C);
+    
+    alloc_bf16(ws.cos_tab, cfg.T * cfg.D);
+    alloc_bf16(ws.sin_tab, cfg.T * cfg.D);
+    alloc_bf16(ws.decay_mat_tab, cfg.H * cfg.chunk_size * cfg.chunk_size);
+    alloc_bf16(ws.gamma_cross_tab, cfg.H * cfg.chunk_size);
+    alloc_bf16(ws.gw_tab, cfg.H * cfg.chunk_size);
+    alloc_f32(ws.gamma_c_tab, cfg.H);
+    
+    const size_t attn_state_elements = (size_t)cfg.B * cfg.H * cfg.D * cfg.D;
+    for (int l = 0; l < cfg.num_layers; ++l) {
+        alloc_bf16(ws.layer_attn_state[l], attn_state_elements);
+        cudaMemset(ws.layer_attn_state[l], 0, attn_state_elements * sizeof(__nv_bfloat16));
+    }
+    
+    // Initialize static rotary position embedding tables
+    init_attention_rotary_tables(ws, cfg, 0);
+    cudaDeviceSynchronize();
+    
     // 4. Output & Loss Buffers
     alloc_f32(ws.loss_buffer, 1);
     alloc_f32(ws.l_bal_total, 1);
@@ -213,6 +244,26 @@ void free_full_workspace(FullModelWorkspace& ws) {
     free_p((void*&)ws.layer_moe_out);
     free_p((void*&)ws.layer_h_out);
     free_p((void*&)ws.layer_x2);
+    
+    free_p((void*&)ws.attn_q_chunks);
+    free_p((void*&)ws.attn_k_chunks);
+    free_p((void*&)ws.attn_v_chunks);
+    free_p((void*&)ws.attn_v_w_chunks);
+    free_p((void*&)ws.attn_scores);
+    free_p((void*&)ws.attn_intra_out);
+    free_p((void*&)ws.attn_delta_s);
+    free_p((void*&)ws.attn_all_states);
+    free_p((void*&)ws.attn_cross_out);
+    free_p((void*&)ws.layer_attn_context);
+    free_p((void*&)ws.cos_tab);
+    free_p((void*&)ws.sin_tab);
+    free_p((void*&)ws.decay_mat_tab);
+    free_p((void*&)ws.gamma_cross_tab);
+    free_p((void*&)ws.gw_tab);
+    free_p((void*&)ws.gamma_c_tab);
+    for (int l = 0; l < 24; ++l) {
+        free_p((void*&)ws.layer_attn_state[l]);
+    }
     
     free_p((void*&)ws.loss_buffer);
     free_p((void*&)ws.l_bal_total);

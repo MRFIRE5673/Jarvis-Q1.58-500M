@@ -3,11 +3,13 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cublas_v2.h>
 #include <cstddef>
 
 // Lifecycle
 void init_cublaslt_engine(size_t workspace_bytes = 64 * 1024 * 1024);
 void cleanup_cublaslt_engine();
+cublasHandle_t get_cublas_handle();
 
 // Forward GEMMs (Pure native cuBLASLt execution on Tensor Cores)
 void cublaslt_gemm_qkv_fwd(

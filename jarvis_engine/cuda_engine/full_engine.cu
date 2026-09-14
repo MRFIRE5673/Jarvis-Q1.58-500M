@@ -1,6 +1,7 @@
 #include "full_engine.h"
 #include "optimizer.h"
 #include "cublaslt_engine.h"
+#include "attention.h"
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -140,9 +141,8 @@ void run_full_model_forward(
             cublaslt_gemm_qkv_fwd(ws.layer_x_norm1, lay.qkv_weight, ws.layer_qkv, M, C, stream);
         }
         
-        // Step 2c: Attention Out Projection GEMM: (M, C) @ (C, C).T -> (M, C)
-        // First C elements of layer_qkv is q_chunk
-        cublaslt_gemm_attn_out_fwd(ws.layer_qkv, lay.out_proj_weight, ws.layer_attn_out, M, C, stream);
+        // Step 2c: Native Associative Linear Attention Forward Pipeline
+        run_native_associative_attention_forward(ws, lay, l, cfg, stream);
         
         // Step 2d: Fused Residual 1 + RMSNorm 2 (Phase 16 Single-Pass Breakthrough)
         // Computes x1 = cur_x + attn_out AND x_norm2 = RMSNorm(x1) in ONE memory pass!
@@ -456,8 +456,8 @@ void run_interleaved_forward(
                 cublaslt_gemm_qkv_fwd(ws.layer_x_norm1, lay.qkv_weight, ws.layer_qkv, M, C, stream);
             }
             
-            // Step 2c: Attention Out GEMM
-            cublaslt_gemm_attn_out_fwd(ws.layer_qkv, lay.out_proj_weight, ws.layer_attn_out, M, C, stream);
+            // Step 2c: Native Associative Linear Attention Forward Pipeline
+            run_native_associative_attention_forward(ws, lay, l, cfg, stream);
             
             // Step 2d: Fused Residual 1 + RMSNorm 2
             if (cfg.use_fused_rmsnorm_quant && cfg.use_fp8_moe) {

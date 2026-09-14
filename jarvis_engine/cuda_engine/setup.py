@@ -89,7 +89,7 @@ setup(
                 os.path.join(current_dir, "cublaslt_engine.cu"),
             ],
             include_dirs=[current_dir],
-            libraries=["cublasLt"],
+            libraries=["cublasLt", "cublas"],
             extra_compile_args={
                 "cxx": extra_cflags,
                 "nvcc": extra_cuda_cflags,
