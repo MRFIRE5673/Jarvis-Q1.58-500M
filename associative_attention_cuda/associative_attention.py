@@ -215,9 +215,16 @@ class CUDAAssociativeLinearAttention(nn.Module):
         cs = self.CHUNK_SIZE
 
         # 1. Projections
-        q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)  # (B, H, T, D)
-        k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
+        if hasattr(self, 'qkv_proj') and self.qkv_proj is not None:
+            qkv = self.qkv_proj(x)
+            q, k, v = qkv.chunk(3, dim=-1)
+            q = q.view(B, T, H, D).transpose(1, 2)
+            k = k.view(B, T, H, D).transpose(1, 2)
+            v = v.view(B, T, H, D).transpose(1, 2)
+        else:
+            q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)  # (B, H, T, D)
+            k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)
+            v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
 
         # Ensure rotary embedding cache covers current sequence
         end_pos = start_pos + T

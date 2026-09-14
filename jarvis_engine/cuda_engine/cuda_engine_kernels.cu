@@ -171,16 +171,23 @@ __global__ void fused_add_rmsnorm_fwd_kernel(
     __nv_bfloat16* row_add = out_add ? (out_add + row * C) : nullptr;
     __nv_bfloat16* row_norm = out_norm + row * C;
     
-    // Phase 1: Sum of squares
+    // Phase 1: Sum of squares + Register Caching (EXP-28-002 / BUG-009)
+    __nv_bfloat16 cached_val[8];
+    int item_idx = 0;
+    
     for (int col = tid; col < C; col += BLOCK_SIZE) {
         float val = __bfloat162float(row_x[col]);
         if (row_res) {
             val += __bfloat162float(row_res[col]);
         }
+        __nv_bfloat16 val_bf16 = __float2bfloat16(val);
         if (row_add) {
-            row_add[col] = __float2bfloat16(val);
+            row_add[col] = val_bf16;
         }
         sum_sq += val * val;
+        if (item_idx < 8) {
+            cached_val[item_idx++] = row_add ? val_bf16 : row_x[col];
+        }
     }
     
     // Block-level reduction
@@ -214,9 +221,11 @@ __global__ void fused_add_rmsnorm_fwd_kernel(
         rsqrt_out[row] = rsqrt_val;
     }
     
-    // Phase 2: Normalize and scale
+    // Phase 2: Normalize and scale using cached register values (zero DRAM re-read)
+    item_idx = 0;
     for (int col = tid; col < C; col += BLOCK_SIZE) {
-        float val = row_add ? __bfloat162float(row_add[col]) : __bfloat162float(row_x[col]);
+        float val = (item_idx < 8) ? __bfloat162float(cached_val[item_idx++])
+                                   : (row_add ? __bfloat162float(row_add[col]) : __bfloat162float(row_x[col]));
         float w = __bfloat162float(weight[col]);
         row_norm[col] = __float2bfloat16(val * rsqrt_val * w);
     }

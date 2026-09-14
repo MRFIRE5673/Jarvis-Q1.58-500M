@@ -751,9 +751,9 @@ class PaddedLMHeadFunction(torch.autograd.Function):
         zero_g = torch.zeros(M, pad_rows, dtype=grad_logits.dtype, device=grad_logits.device)
         grad_logits_pad = torch.cat([grad_logits, zero_g], dim=1)
         
-        grad_x = torch.matmul(grad_logits_pad, w_pad)
-        grad_w_pad = torch.matmul(grad_logits_pad.t(), x)
-        grad_w = grad_w_pad[:V, :]
+        grad_x = torch.matmul(grad_logits_pad, w_pad.to(grad_logits_pad.dtype))
+        grad_w_pad = torch.matmul(grad_logits_pad.t(), x.to(grad_logits_pad.dtype))
+        grad_w = grad_w_pad[:V, :].to(w_pad.dtype)
         
         return grad_x, grad_w, None
 

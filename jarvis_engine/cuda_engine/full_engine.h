@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cstdint>
 #include <vector>
 
@@ -20,6 +21,10 @@ struct FullJarvisConfig {
     int vocab_size = 50257; // GPT-2 vocabulary size
     int vocab_pad = 50304;  // 64-aligned padded vocabulary for Tensor Cores
     int accum_steps = 2;    // Gradient accumulation steps (2 * 4 * 512 = 4096 tokens/update)
+    bool use_fp8_moe = false; // Phase 28: Native FP8 MoE forward toggle
+    bool use_fp8_lm_head = false; // Phase 28: Native FP8 LM Head forward toggle
+    bool use_fp8_lm_head_backward = false; // Phase 28: Native FP8 LM Head backward toggle
+    bool use_bf16_moments = false;        // Phase 29: Native BF16 moments optimizer state toggle (14 B/elem)
     
     int M() const { return B * T; }                     // 2048 tokens per microstep
     int total_tokens_per_step() const { return B * T * accum_steps; } // 4096 tokens
@@ -34,6 +39,8 @@ struct LayerWeights {
     __nv_bfloat16* router_weight;    // (E, C)
     __nv_bfloat16* w1_weights[4];    // 4 experts, each (hidden_dim, C)
     __nv_bfloat16* w2_weights[4];    // 4 experts, each (C, hidden_dim)
+    __nv_fp8_e4m3* w1_weights_fp8[4];// 4 experts, FP8 E4M3 pre-scaled
+    __nv_fp8_e4m3* w2_weights_fp8[4];// 4 experts, FP8 E4M3 pre-scaled
     float*         gamma_raw;        // (H)
     float*         var_scale;        // (1)
     
@@ -48,14 +55,21 @@ struct LayerWeights {
     float*         d_gamma_raw;
     float*         d_var_scale;
     
-    // AdamW momentum buffers (m, v in FP32)
-    float* m_norm1; float* v_norm1;
-    float* m_qkv;   float* v_qkv;
-    float* m_out;   float* v_out;
-    float* m_norm2; float* v_norm2;
-    float* m_router;float* v_router;
-    float* m_w1[4]; float* v_w1[4];
-    float* m_w2[4]; float* v_w2[4];
+    // AdamW momentum buffers (dual precision: FP32 or BF16)
+    union { float* m_norm1; __nv_bfloat16* m_norm1_bf16; };
+    union { float* v_norm1; __nv_bfloat16* v_norm1_bf16; };
+    union { float* m_qkv;   __nv_bfloat16* m_qkv_bf16; };
+    union { float* v_qkv;   __nv_bfloat16* v_qkv_bf16; };
+    union { float* m_out;   __nv_bfloat16* m_out_bf16; };
+    union { float* v_out;   __nv_bfloat16* v_out_bf16; };
+    union { float* m_norm2; __nv_bfloat16* m_norm2_bf16; };
+    union { float* v_norm2; __nv_bfloat16* v_norm2_bf16; };
+    union { float* m_router;__nv_bfloat16* m_router_bf16; };
+    union { float* v_router;__nv_bfloat16* v_router_bf16; };
+    union { float* m_w1[4]; __nv_bfloat16* m_w1_bf16[4]; };
+    union { float* v_w1[4]; __nv_bfloat16* v_w1_bf16[4]; };
+    union { float* m_w2[4]; __nv_bfloat16* m_w2_bf16[4]; };
+    union { float* v_w2[4]; __nv_bfloat16* v_w2_bf16[4]; };
     float* m_gamma; float* v_gamma;
     float* m_var;   float* v_var;
 };
@@ -64,18 +78,19 @@ struct LayerWeights {
 struct FullModelParameters {
     __nv_bfloat16* tok_emb_weight;   // (vocab_size, C)
     __nv_bfloat16* d_tok_emb_weight; // (vocab_size, C)
-    float*         m_tok_emb;
-    float*         v_tok_emb;
+    union { float* m_tok_emb; __nv_bfloat16* m_tok_emb_bf16; };
+    union { float* v_tok_emb; __nv_bfloat16* v_tok_emb_bf16; };
     
     __nv_bfloat16* final_norm_weight;   // (C)
     __nv_bfloat16* d_final_norm_weight; // (C)
-    float*         m_final_norm;
-    float*         v_final_norm;
+    union { float* m_final_norm; __nv_bfloat16* m_final_norm_bf16; };
+    union { float* v_final_norm; __nv_bfloat16* v_final_norm_bf16; };
     
     __nv_bfloat16* lm_head_weight;   // (vocab_pad, C)
+    __nv_fp8_e4m3* lm_head_weight_fp8; // (vocab_pad, C) FP8 E4M3
     __nv_bfloat16* d_lm_head_weight; // (vocab_pad, C)
-    float*         m_lm_head;
-    float*         v_lm_head;
+    union { float* m_lm_head; __nv_bfloat16* m_lm_head_bf16; };
+    union { float* v_lm_head; __nv_bfloat16* v_lm_head_bf16; };
     
     LayerWeights layers[24];
 };
@@ -107,8 +122,10 @@ struct FullModelWorkspace {
     int32_t*       layer_scatter_map;   // (M * top_k)
     int32_t*       layer_gate_idx_map;  // (M * top_k)
     __nv_bfloat16* layer_dispatched_x;  // (M * top_k, C)
+    __nv_fp8_e4m3* layer_dispatched_x_fp8; // (M * top_k, C) FP8 E4M3
     __nv_bfloat16* layer_h1;            // (M * top_k, hidden_dim)
     __nv_bfloat16* layer_act;           // (M * top_k, hidden_dim)
+    __nv_fp8_e4m3* layer_act_fp8;       // (M * top_k, hidden_dim) FP8 E4M3
     __nv_bfloat16* layer_dispatched_y;  // (M * top_k, C)
     __nv_bfloat16* layer_moe_out;       // (M, C)
     __nv_bfloat16* layer_h_out;         // (M, C) LSF state
@@ -117,6 +134,7 @@ struct FullModelWorkspace {
     
     // 4. Output & Loss Buffers
     __nv_bfloat16* final_norm_out;   // (M, C)
+    __nv_fp8_e4m3* final_norm_out_fp8; // (M, C) FP8 E4M3
     float*         final_rsqrt;      // (M)
     __nv_bfloat16* logits;           // (M, vocab_pad)
     float*         loss_buffer;      // (1)
@@ -125,6 +143,7 @@ struct FullModelWorkspace {
     
     // 5. Backward Gradient Buffers (Reusable layer buffers)
     __nv_bfloat16* d_logits;         // (M, vocab_pad)
+    __nv_fp8_e4m3* d_logits_fp8;     // (M, vocab_pad) FP8 E4M3
     __nv_bfloat16* d_final_norm_out; // (M, C)
     __nv_bfloat16* d_layer_x;        // (M, C) ping-pong buffer A
     __nv_bfloat16* d_layer_x_prev;   // (M, C) ping-pong buffer B
@@ -148,9 +167,11 @@ struct FullModelWorkspace {
     __nv_bfloat16* stashed_x_ms[2][24];
     __nv_bfloat16* layer_x2_ms[2];
     __nv_bfloat16* final_norm_out_ms[2];
+    __nv_fp8_e4m3* final_norm_out_fp8_ms[2];
     float*         final_rsqrt_ms[2];
     __nv_bfloat16* logits_ms[2];
     __nv_bfloat16* d_logits_ms[2];
+    __nv_fp8_e4m3* d_logits_fp8_ms[2];
     __nv_bfloat16* d_final_norm_out_ms[2];
     __nv_bfloat16* d_layer_x_ms[2];
     __nv_bfloat16* d_layer_x_prev_ms[2];

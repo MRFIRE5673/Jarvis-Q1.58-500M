@@ -38,9 +38,21 @@ static cublasLtMatrixLayout_t g_layout_w2 = nullptr;
 static cublasLtMatrixLayout_t g_layout_disp_y = nullptr;
 static cublasLtMatmulAlgo_t g_algo_w2_fwd;
 
+// Phase 28: FP8 MoE Operation Descriptors, Layouts, and Algorithms
+static cublasLtMatmulDesc_t g_desc_nt_fp8 = nullptr;
+static cublasLtMatrixLayout_t g_layout_w1_fp8 = nullptr;
+static cublasLtMatrixLayout_t g_layout_x_disp_fp8 = nullptr;
+static cublasLtMatrixLayout_t g_layout_w2_fp8 = nullptr;
+static cublasLtMatrixLayout_t g_layout_act_fp8 = nullptr;
+static cublasLtMatmulAlgo_t g_algo_w1_fp8;
+static cublasLtMatmulAlgo_t g_algo_w2_fp8;
+
 static cublasLtMatrixLayout_t g_layout_w_lm_head = nullptr;
+static cublasLtMatrixLayout_t g_layout_w_lm_head_fp8 = nullptr;
+static cublasLtMatrixLayout_t g_layout_x_2048_1024_fp8 = nullptr;
 static cublasLtMatrixLayout_t g_layout_logits = nullptr;
 static cublasLtMatmulAlgo_t g_algo_lm_head_fwd;
+static cublasLtMatmulAlgo_t g_algo_lm_head_fwd_fp8;
 
 static cublasLtMatrixLayout_t g_layout_d_logits_nn = nullptr;
 static cublasLtMatrixLayout_t g_layout_w_lm_head_nn = nullptr;
@@ -51,6 +63,14 @@ static cublasLtMatrixLayout_t g_layout_d_logits_tn = nullptr;
 static cublasLtMatrixLayout_t g_layout_final_norm_tn = nullptr;
 static cublasLtMatrixLayout_t g_layout_d_lm_head_tn = nullptr;
 static cublasLtMatmulAlgo_t g_algo_lm_head_bwd_dw;
+
+// Phase 28: FP8 LM Head Backward
+static cublasLtMatmulDesc_t g_desc_nn_fp8 = nullptr;
+static cublasLtMatmulDesc_t g_desc_tn_fp8 = nullptr;
+static cublasLtMatrixLayout_t g_layout_d_logits_nn_fp8 = nullptr;
+static cublasLtMatrixLayout_t g_layout_d_logits_tn_fp8 = nullptr;
+static cublasLtMatmulAlgo_t g_algo_lm_head_bwd_dx_fp8;
+static cublasLtMatmulAlgo_t g_algo_lm_head_bwd_dw_fp8;
 
 static cublasLtMatrixLayout_t g_layout_d_x_tn = nullptr;
 static cublasLtMatrixLayout_t g_layout_stashed_x_tn = nullptr;
@@ -212,10 +232,28 @@ void init_cublaslt_engine(size_t workspace_bytes) {
     cublasLtMatrixLayoutCreate(&g_layout_disp_y, CUDA_R_16BF, 1024, 4096, 1024);
     g_algo_w2_fwd = autotune_matmul_algo(g_lt, g_desc_nt, g_layout_w2, g_layout_act, g_layout_disp_y, g_layout_disp_y, pref, d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "MoE W2 Fwd", 3);
     
+    // E2. Phase 28: FP8 MoE W1 & W2 Layouts and Algorithms
+    cublasLtMatmulDescCreate(&g_desc_nt_fp8, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasLtMatmulDescSetAttribute(g_desc_nt_fp8, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
+    cublasLtMatmulDescSetAttribute(g_desc_nt_fp8, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+    
+    cublasLtMatrixLayoutCreate(&g_layout_w1_fp8, CUDA_R_8F_E4M3, 1024, 2048, 1024);
+    cublasLtMatrixLayoutCreate(&g_layout_x_disp_fp8, CUDA_R_8F_E4M3, 1024, 4096, 1024);
+    g_algo_w1_fp8 = autotune_matmul_algo(g_lt, g_desc_nt_fp8, g_layout_w1_fp8, g_layout_x_disp_fp8, g_layout_h1, g_layout_h1, pref, d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "MoE W1 FP8", 1);
+    
+    cublasLtMatrixLayoutCreate(&g_layout_w2_fp8, CUDA_R_8F_E4M3, 2048, 1024, 2048);
+    cublasLtMatrixLayoutCreate(&g_layout_act_fp8, CUDA_R_8F_E4M3, 2048, 4096, 2048);
+    g_algo_w2_fp8 = autotune_matmul_algo(g_lt, g_desc_nt_fp8, g_layout_w2_fp8, g_layout_act_fp8, g_layout_disp_y, g_layout_disp_y, pref, d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "MoE W2 FP8", 1);
+    
     // F. LM Head Forward: C (2048 x 50304) = A (2048 x 1024) * B^T (50304 x 1024).T
     cublasLtMatrixLayoutCreate(&g_layout_w_lm_head, CUDA_R_16BF, 1024, 50304, 1024);
     cublasLtMatrixLayoutCreate(&g_layout_logits, CUDA_R_16BF, 50304, 2048, 50304);
     g_algo_lm_head_fwd = autotune_matmul_algo(g_lt, g_desc_nt, g_layout_w_lm_head, g_layout_x_2048_1024, g_layout_logits, g_layout_logits, pref, d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "LM Head Fwd", 0);
+    
+    // F2. Phase 28: FP8 LM Head Forward
+    cublasLtMatrixLayoutCreate(&g_layout_w_lm_head_fp8, CUDA_R_8F_E4M3, 1024, 50304, 1024);
+    cublasLtMatrixLayoutCreate(&g_layout_x_2048_1024_fp8, CUDA_R_8F_E4M3, 1024, 2048, 1024);
+    g_algo_lm_head_fwd_fp8 = autotune_matmul_algo(g_lt, g_desc_nt_fp8, g_layout_w_lm_head_fp8, g_layout_x_2048_1024_fp8, g_layout_logits, g_layout_logits, pref, d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "LM Head FP8 Fwd", 0);
     
     // G. LM Head Bwd dX: C (2048 x 1024) = A (2048 x 50304) * B (50304 x 1024)
     cublasLtMatrixLayoutCreate(&g_layout_w_lm_head_nn, CUDA_R_16BF, 1024, 50304, 1024);
@@ -228,6 +266,30 @@ void init_cublaslt_engine(size_t workspace_bytes) {
     cublasLtMatrixLayoutCreate(&g_layout_d_logits_tn, CUDA_R_16BF, 50304, 2048, 50304);
     cublasLtMatrixLayoutCreate(&g_layout_d_lm_head_tn, CUDA_R_16BF, 1024, 50304, 1024);
     g_algo_lm_head_bwd_dw = autotune_matmul_algo(g_lt, g_desc_tn, g_layout_final_norm_tn, g_layout_d_logits_tn, g_layout_d_lm_head_tn, g_layout_d_lm_head_tn, pref, d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 1.0f, g_ws, g_ws_size, "LM Head Bwd dW", 1);
+    
+    // H2. Phase 28: FP8 LM Head Backward Layouts & Algorithms
+    cublasLtMatmulDescCreate(&g_desc_nn_fp8, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasLtMatmulDescSetAttribute(g_desc_nn_fp8, CUBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN));
+    cublasLtMatmulDescSetAttribute(g_desc_nn_fp8, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+
+    cublasLtMatmulDescCreate(&g_desc_tn_fp8, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasLtMatmulDescSetAttribute(g_desc_tn_fp8, CUBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN));
+    cublasLtMatmulDescSetAttribute(g_desc_tn_fp8, CUBLASLT_MATMUL_DESC_TRANSB, &opT, sizeof(opT));
+
+    cublasLtMatrixLayoutCreate(&g_layout_d_logits_nn_fp8, CUDA_R_8F_E4M3, 50304, 2048, 50304);
+    cublasLtMatrixLayoutCreate(&g_layout_d_logits_tn_fp8, CUDA_R_8F_E4M3, 50304, 2048, 50304);
+
+    g_algo_lm_head_bwd_dx_fp8 = autotune_matmul_algo(
+        g_lt, g_desc_nn_fp8, g_layout_w_lm_head_fp8, g_layout_d_logits_nn_fp8,
+        g_layout_d_final_norm_nn, g_layout_d_final_norm_nn, pref,
+        d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 0.0f, g_ws, g_ws_size, "LM Head Bwd dX FP8", 0
+    );
+
+    g_algo_lm_head_bwd_dw_fp8 = autotune_matmul_algo(
+        g_lt, g_desc_tn_fp8, g_layout_x_2048_1024_fp8, g_layout_d_logits_tn_fp8,
+        g_layout_d_lm_head_tn, g_layout_d_lm_head_tn, pref,
+        d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 1.0f, g_ws, g_ws_size, "LM Head Bwd dW FP8", 0
+    );
     
     // I. QKV Bwd dSlice: C (1024 x 1024) += A^T (2048 x 1024).T * B (2048 x 1024)
     cublasLtMatrixLayoutCreate(&g_layout_stashed_x_tn, CUDA_R_16BF, 1024, 2048, 1024);
@@ -254,16 +316,29 @@ void cleanup_cublaslt_engine() {
     cublasLtMatrixLayoutDestroy(g_layout_d_logits_tn);
     cublasLtMatrixLayoutDestroy(g_layout_final_norm_tn);
     
+    cublasLtMatrixLayoutDestroy(g_layout_d_logits_tn_fp8);
+    cublasLtMatrixLayoutDestroy(g_layout_d_logits_nn_fp8);
+    cublasLtMatmulDescDestroy(g_desc_tn_fp8);
+    cublasLtMatmulDescDestroy(g_desc_nn_fp8);
+    
     cublasLtMatrixLayoutDestroy(g_layout_d_final_norm_nn);
     cublasLtMatrixLayoutDestroy(g_layout_d_logits_nn);
     cublasLtMatrixLayoutDestroy(g_layout_w_lm_head_nn);
     
     cublasLtMatrixLayoutDestroy(g_layout_logits);
     cublasLtMatrixLayoutDestroy(g_layout_w_lm_head);
+    cublasLtMatrixLayoutDestroy(g_layout_x_2048_1024_fp8);
+    cublasLtMatrixLayoutDestroy(g_layout_w_lm_head_fp8);
     
     cublasLtMatrixLayoutDestroy(g_layout_disp_y);
     cublasLtMatrixLayoutDestroy(g_layout_w2);
     cublasLtMatrixLayoutDestroy(g_layout_act);
+    
+    cublasLtMatrixLayoutDestroy(g_layout_act_fp8);
+    cublasLtMatrixLayoutDestroy(g_layout_w2_fp8);
+    cublasLtMatrixLayoutDestroy(g_layout_x_disp_fp8);
+    cublasLtMatrixLayoutDestroy(g_layout_w1_fp8);
+    cublasLtMatmulDescDestroy(g_desc_nt_fp8);
     
     cublasLtMatrixLayoutDestroy(g_layout_h1);
     cublasLtMatrixLayoutDestroy(g_layout_x_disp);
@@ -360,6 +435,32 @@ void cublaslt_gemm_moe_w2_fwd(
     );
 }
 
+// 5b. Phase 28: MoE W1 FP8 Forward
+void cublaslt_gemm_moe_w1_fp8(
+    const __nv_fp8_e4m3* disp_x, const __nv_fp8_e4m3* w1, __nv_bfloat16* h1,
+    int total_dispatched, int C, int hidden_dim, float alpha, cudaStream_t stream
+) {
+    float beta = 0.0f;
+    cublasLtMatmul(
+        g_lt, g_desc_nt_fp8, &alpha, w1, g_layout_w1_fp8, disp_x, g_layout_x_disp_fp8,
+        &beta, h1, g_layout_h1, h1, g_layout_h1,
+        &g_algo_w1_fp8, g_ws, g_ws_size, stream
+    );
+}
+
+// 5c. Phase 28: MoE W2 FP8 Forward
+void cublaslt_gemm_moe_w2_fp8(
+    const __nv_fp8_e4m3* act, const __nv_fp8_e4m3* w2, __nv_bfloat16* disp_y,
+    int total_dispatched, int hidden_dim, int C, float alpha, cudaStream_t stream
+) {
+    float beta = 0.0f;
+    cublasLtMatmul(
+        g_lt, g_desc_nt_fp8, &alpha, w2, g_layout_w2_fp8, act, g_layout_act_fp8,
+        &beta, disp_y, g_layout_disp_y, disp_y, g_layout_disp_y,
+        &g_algo_w2_fp8, g_ws, g_ws_size, stream
+    );
+}
+
 // 6. LM Head Forward
 void cublaslt_gemm_lm_head_fwd(
     const __nv_bfloat16* final_norm, const __nv_bfloat16* lm_head_w, __nv_bfloat16* logits,
@@ -370,6 +471,19 @@ void cublaslt_gemm_lm_head_fwd(
         g_lt, g_desc_nt, &alpha, lm_head_w, g_layout_w_lm_head, final_norm, g_layout_x_2048_1024,
         &beta, logits, g_layout_logits, logits, g_layout_logits,
         &g_algo_lm_head_fwd, g_ws, g_ws_size, stream
+    );
+}
+
+// 6b. Phase 28: FP8 LM Head Forward
+void cublaslt_gemm_lm_head_fwd_fp8(
+    const __nv_fp8_e4m3* final_norm, const __nv_fp8_e4m3* lm_head_w, __nv_bfloat16* logits,
+    int M, int C, int vocab_pad, float alpha, cudaStream_t stream
+) {
+    float beta = 0.0f;
+    cublasLtMatmul(
+        g_lt, g_desc_nt_fp8, &alpha, lm_head_w, g_layout_w_lm_head_fp8, final_norm, g_layout_x_2048_1024_fp8,
+        &beta, logits, g_layout_logits, logits, g_layout_logits,
+        &g_algo_lm_head_fwd_fp8, g_ws, g_ws_size, stream
     );
 }
 
@@ -396,6 +510,31 @@ void cublaslt_gemm_lm_head_bwd_dw(
         g_lt, g_desc_tn, &alpha, final_norm, g_layout_final_norm_tn, d_logits, g_layout_d_logits_tn,
         &beta, d_lm_head_w, g_layout_d_lm_head_tn, d_lm_head_w, g_layout_d_lm_head_tn,
         &g_algo_lm_head_bwd_dw, g_ws, g_ws_size, stream
+    );
+}
+
+// 7b. Phase 28: FP8 LM Head Backward dX
+void cublaslt_gemm_lm_head_bwd_dx_fp8(
+    const __nv_fp8_e4m3* d_logits, const __nv_fp8_e4m3* lm_head_w, __nv_bfloat16* d_final_norm,
+    int M, int vocab_pad, int C, float alpha, cudaStream_t stream
+) {
+    float beta = 0.0f;
+    cublasLtMatmul(
+        g_lt, g_desc_nn_fp8, &alpha, lm_head_w, g_layout_w_lm_head_fp8, d_logits, g_layout_d_logits_nn_fp8,
+        &beta, d_final_norm, g_layout_d_final_norm_nn, d_final_norm, g_layout_d_final_norm_nn,
+        &g_algo_lm_head_bwd_dx_fp8, g_ws, g_ws_size, stream
+    );
+}
+
+// 8b. Phase 28: FP8 LM Head Backward dW
+void cublaslt_gemm_lm_head_bwd_dw_fp8(
+    const __nv_fp8_e4m3* d_logits, const __nv_fp8_e4m3* final_norm, __nv_bfloat16* d_lm_head_w,
+    int M, int vocab_pad, int C, float alpha, float beta, cudaStream_t stream
+) {
+    cublasLtMatmul(
+        g_lt, g_desc_tn_fp8, &alpha, final_norm, g_layout_x_2048_1024_fp8, d_logits, g_layout_d_logits_tn_fp8,
+        &beta, d_lm_head_w, g_layout_d_lm_head_tn, d_lm_head_w, g_layout_d_lm_head_tn,
+        &g_algo_lm_head_bwd_dw_fp8, g_ws, g_ws_size, stream
     );
 }
 

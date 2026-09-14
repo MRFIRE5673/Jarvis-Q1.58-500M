@@ -1,6 +1,7 @@
 #include "runtime.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -40,6 +41,11 @@ FullModelWorkspace allocate_full_workspace(const FullJarvisConfig& cfg) {
         CHECK_CUDA(cudaMalloc(&ptr, bytes));
         total += bytes;
     };
+    auto alloc_fp8 = [&](__nv_fp8_e4m3*& ptr, size_t count) {
+        size_t bytes = count * sizeof(__nv_fp8_e4m3);
+        CHECK_CUDA(cudaMalloc(&ptr, bytes));
+        total += bytes;
+    };
     
     // 1. Input & Embedding Buffers (Phase 22 Dual Microstep Allocation)
     for (int ms = 0; ms < 2; ++ms) {
@@ -48,9 +54,11 @@ FullModelWorkspace allocate_full_workspace(const FullJarvisConfig& cfg) {
         alloc_bf16(ws.emb_out_ms[ms], M * C);
         alloc_bf16(ws.layer_x2_ms[ms], M * C);
         alloc_bf16(ws.final_norm_out_ms[ms], M * C);
+        alloc_fp8(ws.final_norm_out_fp8_ms[ms], M * C);
         alloc_f32(ws.final_rsqrt_ms[ms], M);
         alloc_bf16(ws.logits_ms[ms], M * vocab_pad);
         alloc_bf16(ws.d_logits_ms[ms], M * vocab_pad);
+        alloc_fp8(ws.d_logits_fp8_ms[ms], (size_t)M * vocab_pad);
         alloc_bf16(ws.d_final_norm_out_ms[ms], M * C);
         alloc_bf16(ws.d_layer_x_ms[ms], M * C);
         alloc_bf16(ws.d_layer_x_prev_ms[ms], M * C);
@@ -60,9 +68,11 @@ FullModelWorkspace allocate_full_workspace(const FullJarvisConfig& cfg) {
     ws.targets = ws.targets_ms[0];
     ws.emb_out = ws.emb_out_ms[0];
     ws.final_norm_out = ws.final_norm_out_ms[0];
+    ws.final_norm_out_fp8 = ws.final_norm_out_fp8_ms[0];
     ws.final_rsqrt = ws.final_rsqrt_ms[0];
     ws.logits = ws.logits_ms[0];
     ws.d_logits = ws.d_logits_ms[0];
+    ws.d_logits_fp8 = ws.d_logits_fp8_ms[0];
     ws.d_final_norm_out = ws.d_final_norm_out_ms[0];
     ws.d_layer_x = ws.d_layer_x_ms[0];
     ws.d_layer_x_prev = ws.d_layer_x_prev_ms[0];
@@ -94,8 +104,10 @@ FullModelWorkspace allocate_full_workspace(const FullJarvisConfig& cfg) {
     alloc_i32(ws.layer_scatter_map, M * top_k);
     alloc_i32(ws.layer_gate_idx_map, M * top_k);
     alloc_bf16(ws.layer_dispatched_x, M * top_k * C);
+    alloc_fp8(ws.layer_dispatched_x_fp8, M * top_k * C);
     alloc_bf16(ws.layer_h1, M * top_k * hidden_dim);
     alloc_bf16(ws.layer_act, M * top_k * hidden_dim);
+    alloc_fp8(ws.layer_act_fp8, M * top_k * hidden_dim);
     alloc_bf16(ws.layer_dispatched_y, M * top_k * C);
     alloc_bf16(ws.layer_moe_out, M * C);
     alloc_bf16(ws.layer_h_out, M * C);
@@ -152,9 +164,11 @@ void free_full_workspace(FullModelWorkspace& ws) {
         free_p((void*&)ws.emb_out_ms[ms]);
         free_p((void*&)ws.layer_x2_ms[ms]);
         free_p((void*&)ws.final_norm_out_ms[ms]);
+        free_p((void*&)ws.final_norm_out_fp8_ms[ms]);
         free_p((void*&)ws.final_rsqrt_ms[ms]);
         free_p((void*&)ws.logits_ms[ms]);
         free_p((void*&)ws.d_logits_ms[ms]);
+        free_p((void*&)ws.d_logits_fp8_ms[ms]);
         free_p((void*&)ws.d_final_norm_out_ms[ms]);
         free_p((void*&)ws.d_layer_x_ms[ms]);
         free_p((void*&)ws.d_layer_x_prev_ms[ms]);
@@ -181,8 +195,10 @@ void free_full_workspace(FullModelWorkspace& ws) {
     free_p((void*&)ws.layer_scatter_map);
     free_p((void*&)ws.layer_gate_idx_map);
     free_p((void*&)ws.layer_dispatched_x);
+    free_p((void*&)ws.layer_dispatched_x_fp8);
     free_p((void*&)ws.layer_h1);
     free_p((void*&)ws.layer_act);
+    free_p((void*&)ws.layer_act_fp8);
     free_p((void*&)ws.layer_dispatched_y);
     free_p((void*&)ws.layer_moe_out);
     free_p((void*&)ws.layer_h_out);

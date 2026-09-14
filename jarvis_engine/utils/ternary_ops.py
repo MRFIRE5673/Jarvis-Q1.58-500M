@@ -118,3 +118,34 @@ class TernaryLinear(nn.Module):
     def forward(self, x):
         w_q = TernaryQuantizeSTE.apply(self.weight)
         return F.linear(x, w_q, self.bias)
+
+
+class FusedQKVSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, weight):
+        # weight: (3 * d_model, d_model) -> 3 projections: Q, K, V
+        ctx.save_for_backward(weight)
+        d_model = weight.shape[1]
+        w_split = weight.view(3, d_model, d_model)
+        alpha = w_split.abs().mean(dim=(1, 2), keepdim=True).clamp(min=1e-5)
+        w_norm = (w_split / alpha).clamp(-1.0, 1.0).round()
+        w_q = (w_norm * alpha).view(3 * d_model, d_model)
+        return w_q
+
+    @staticmethod
+    def backward(ctx, grad_w_q):
+        weight, = ctx.saved_tensors
+        mask = (weight.abs() <= 1.0).to(grad_w_q.dtype)
+        return grad_w_q * mask
+
+
+class FusedQKVLinear(nn.Module):
+    def __init__(self, d_model=1024):
+        super().__init__()
+        self.d_model = d_model
+        self.weight = nn.Parameter(torch.empty(3 * d_model, d_model))
+        nn.init.normal_(self.weight, std=0.02)
+
+    def forward(self, x):
+        w_q = FusedQKVSTE.apply(self.weight)
+        return F.linear(x, w_q)

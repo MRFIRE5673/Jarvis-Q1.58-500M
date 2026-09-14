@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <math.h>
 
 // ---------------------------------------------------------------------------
@@ -349,3 +350,95 @@ void launch_moe_scatter_combine_add_residual(
         dispatched_y, topk_gates, scatter_map, x1, x2, M, C
     );
 }
+
+// ---------------------------------------------------------------------------
+// 6. Phase 28: Vectorized BF16 -> FP8 (E4M3) Conversion Kernel (128-bit)
+// ---------------------------------------------------------------------------
+__global__ void quantize_bf16_to_fp8_e4m3_vec8_kernel(
+    const __nv_bfloat16* __restrict__ in,
+    __nv_fp8_e4m3* __restrict__ out,
+    float scale,
+    int N
+) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (idx + 7 < N) {
+        uint4 raw_in = *reinterpret_cast<const uint4*>(in + idx);
+        const __nv_bfloat16* p_in = reinterpret_cast<const __nv_bfloat16*>(&raw_in);
+        
+        __nv_fp8_e4m3 res[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            float val = __bfloat162float(p_in[k]) * scale;
+            res[k] = __nv_fp8_e4m3(val);
+        }
+        *reinterpret_cast<uint2*>(out + idx) = *reinterpret_cast<uint2*>(res);
+    } else {
+        for (int k = 0; k < 8 && idx + k < N; ++k) {
+            float val = __bfloat162float(in[idx + k]) * scale;
+            out[idx + k] = __nv_fp8_e4m3(val);
+        }
+    }
+}
+
+void launch_quantize_bf16_to_fp8(
+    const __nv_bfloat16* in,
+    __nv_fp8_e4m3* out,
+    float scale,
+    int N,
+    cudaStream_t stream
+) {
+    const int BLOCK = 256;
+    int num_vec = (N + 7) / 8;
+    int grid = (num_vec + BLOCK - 1) / BLOCK;
+    quantize_bf16_to_fp8_e4m3_vec8_kernel<<<grid, BLOCK, 0, stream>>>(in, out, scale, N);
+}
+
+// ---------------------------------------------------------------------------
+// 7. Phase 28: Fused GELU (BF16 in) -> FP8 E4M3 out Kernel (128-bit in, 64-bit out)
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float gelu_val_fp8(float x) {
+    const float k0 = 0.7978845608028654f;
+    const float k1 = 0.044715f;
+    float inner = k0 * (x + k1 * x * x * x);
+    return 0.5f * x * (1.0f + tanhf(inner));
+}
+
+__global__ void fused_gelu_bf16_to_fp8_vec8_kernel(
+    const __nv_bfloat16* __restrict__ in,
+    __nv_fp8_e4m3* __restrict__ out,
+    float scale,
+    int N
+) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (idx + 7 < N) {
+        uint4 raw_in = *reinterpret_cast<const uint4*>(in + idx);
+        const __nv_bfloat16* p_in = reinterpret_cast<const __nv_bfloat16*>(&raw_in);
+        
+        __nv_fp8_e4m3 res[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            float val = gelu_val_fp8(__bfloat162float(p_in[k])) * scale;
+            res[k] = __nv_fp8_e4m3(val);
+        }
+        *reinterpret_cast<uint2*>(out + idx) = *reinterpret_cast<uint2*>(res);
+    } else {
+        for (int k = 0; k < 8 && idx + k < N; ++k) {
+            float val = gelu_val_fp8(__bfloat162float(in[idx + k])) * scale;
+            out[idx + k] = __nv_fp8_e4m3(val);
+        }
+    }
+}
+
+void launch_fused_gelu_bf16_to_fp8(
+    const __nv_bfloat16* in,
+    __nv_fp8_e4m3* out,
+    float scale,
+    int N,
+    cudaStream_t stream
+) {
+    const int BLOCK = 256;
+    int num_vec = (N + 7) / 8;
+    int grid = (num_vec + BLOCK - 1) / BLOCK;
+    fused_gelu_bf16_to_fp8_vec8_kernel<<<grid, BLOCK, 0, stream>>>(in, out, scale, N);
+}
+

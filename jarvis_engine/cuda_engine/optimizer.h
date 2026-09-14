@@ -50,6 +50,21 @@ void launch_fused_adamw_update_bf16(
     cudaStream_t stream
 );
 
+void launch_fused_adamw_update_bf16_moments(
+    __nv_bfloat16* param,
+    __nv_bfloat16* grad,
+    __nv_bfloat16* m,
+    __nv_bfloat16* v,
+    const float* clip_coef,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    int num_elements,
+    cudaStream_t stream
+);
+
 void launch_fused_adamw_update_f32(
     float* param,
     float* grad,

@@ -68,6 +68,15 @@ void launch_moe_scatter_combine_add_residual(
     const __nv_bfloat16* x1, __nv_bfloat16* x2, int M, int C, cudaStream_t stream
 );
 
+// Phase 28: FP8 MoE Quantization & Fused GELU
+void launch_quantize_bf16_to_fp8(
+    const __nv_bfloat16* in, __nv_fp8_e4m3* out, float scale, int N, cudaStream_t stream
+);
+
+void launch_fused_gelu_bf16_to_fp8(
+    const __nv_bfloat16* in, __nv_fp8_e4m3* out, float scale, int N, cudaStream_t stream
+);
+
 // ---------------------------------------------------------------------------
 // Full Model Forward Execution (24 Layers)
 // Zero dynamic allocations: all operations use pre-allocated static workspace
@@ -135,9 +144,16 @@ void run_full_model_forward(
         );
         
         // Step 2g: Expert Computation (Grouped MoE W1 + Fused GELU + W2)
-        cublaslt_gemm_moe_w1_fwd(ws.layer_dispatched_x, lay.w1_weights[0], ws.layer_h1, M * cfg.top_k, C, cfg.hidden_dim, stream);
-        launch_fused_gelu_fwd(ws.layer_h1, ws.layer_act, M * cfg.top_k * cfg.hidden_dim, stream);
-        cublaslt_gemm_moe_w2_fwd(ws.layer_act, lay.w2_weights[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, stream);
+        if (cfg.use_fp8_moe) {
+            launch_quantize_bf16_to_fp8(ws.layer_dispatched_x, ws.layer_dispatched_x_fp8, 16.0f, M * cfg.top_k * C, stream);
+            cublaslt_gemm_moe_w1_fp8(ws.layer_dispatched_x_fp8, lay.w1_weights_fp8[0], ws.layer_h1, M * cfg.top_k, C, cfg.hidden_dim, 1.0f / (16.0f * 64.0f), stream);
+            launch_fused_gelu_bf16_to_fp8(ws.layer_h1, ws.layer_act_fp8, 16.0f, M * cfg.top_k * cfg.hidden_dim, stream);
+            cublaslt_gemm_moe_w2_fp8(ws.layer_act_fp8, lay.w2_weights_fp8[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, 1.0f / (16.0f * 64.0f), stream);
+        } else {
+            cublaslt_gemm_moe_w1_fwd(ws.layer_dispatched_x, lay.w1_weights[0], ws.layer_h1, M * cfg.top_k, C, cfg.hidden_dim, stream);
+            launch_fused_gelu_fwd(ws.layer_h1, ws.layer_act, M * cfg.top_k * cfg.hidden_dim, stream);
+            cublaslt_gemm_moe_w2_fwd(ws.layer_act, lay.w2_weights[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, stream);
+        }
         
         // Step 2h+2i: Fused MoE Scatter Combine + Residual 2 Addition (Single Memory Pass)
         launch_moe_scatter_combine_add_residual(
@@ -155,7 +171,12 @@ void run_full_model_forward(
     );
     
     // 4. Padded LM Head GEMM: (M, C) @ (V_pad, C).T -> (M, V_pad)
-    cublaslt_gemm_lm_head_fwd(ws.final_norm_out, params.lm_head_weight, ws.logits, M, C, cfg.vocab_pad, stream);
+    if (cfg.use_fp8_lm_head) {
+        launch_quantize_bf16_to_fp8(ws.final_norm_out, ws.final_norm_out_fp8, 16.0f, M * C, stream);
+        cublaslt_gemm_lm_head_fwd_fp8(ws.final_norm_out_fp8, params.lm_head_weight_fp8, ws.logits, M, C, cfg.vocab_pad, 1.0f / (16.0f * 64.0f), stream);
+    } else {
+        cublaslt_gemm_lm_head_fwd(ws.final_norm_out, params.lm_head_weight, ws.logits, M, C, cfg.vocab_pad, stream);
+    }
     
     // 5. Fused Cross-Entropy Loss and Analytical dLogits
     launch_fused_cross_entropy_bwd(
@@ -193,8 +214,22 @@ void run_full_model_backward(
     // 1. LM Head Backward:
     // d_final_norm = d_logits @ W_lm_head
     // d_W_lm_head = d_logits.T @ final_norm_out (overwrites on step 0, accumulates on step 1)
-    cublaslt_gemm_lm_head_bwd_dx(ws.d_logits, params.lm_head_weight, ws.d_final_norm_out, M, cfg.vocab_pad, C, stream);
-    cublaslt_gemm_lm_head_bwd_dw(ws.d_logits, ws.final_norm_out, params.d_lm_head_weight, M, cfg.vocab_pad, C, stream, beta);
+    if (cfg.use_fp8_lm_head_backward) {
+        float scale_dlog = 1048576.0f; // 2^20
+        float scale_w = 64.0f;
+        float scale_fn = 16.0f;
+        launch_quantize_bf16_to_fp8(ws.d_logits, ws.d_logits_fp8, scale_dlog, M * cfg.vocab_pad, stream);
+        if (!cfg.use_fp8_lm_head) {
+            launch_quantize_bf16_to_fp8(ws.final_norm_out, ws.final_norm_out_fp8, scale_fn, M * C, stream);
+        }
+        float alpha_dx = 1.0f / (scale_dlog * scale_w);
+        cublaslt_gemm_lm_head_bwd_dx_fp8(ws.d_logits_fp8, params.lm_head_weight_fp8, ws.d_final_norm_out, M, cfg.vocab_pad, C, alpha_dx, stream);
+        float alpha_dw = 1.0f / (scale_dlog * scale_fn);
+        cublaslt_gemm_lm_head_bwd_dw_fp8(ws.d_logits_fp8, ws.final_norm_out_fp8, params.d_lm_head_weight, M, cfg.vocab_pad, C, alpha_dw, beta, stream);
+    } else {
+        cublaslt_gemm_lm_head_bwd_dx(ws.d_logits, params.lm_head_weight, ws.d_final_norm_out, M, cfg.vocab_pad, C, stream);
+        cublaslt_gemm_lm_head_bwd_dw(ws.d_logits, ws.final_norm_out, params.d_lm_head_weight, M, cfg.vocab_pad, C, stream, beta);
+    }
     
     // 2. Final RMSNorm Backward: d_final_norm -> ws.d_layer_x
     launch_fused_rmsnorm_bwd(
@@ -263,6 +298,11 @@ void run_native_training_step(
     
     // Fused AdamW optimizer update with in-kernel norm clipping and zero_grad
     run_fused_optimizer_step(params, ws, cfg, lr, stream);
+    
+    // Phase 28: If FP8 LM Head is used (fwd or bwd), re-quantize lm_head_weight to guarantee NO stale buffers
+    if (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) {
+        launch_quantize_bf16_to_fp8(params.lm_head_weight, params.lm_head_weight_fp8, 64.0f, cfg.vocab_pad * cfg.C, stream);
+    }
 }
 
 
@@ -338,9 +378,16 @@ void run_interleaved_forward(
             launch_moe_dispatch_gather(ws.layer_x_norm2, ws.layer_gather_map, ws.layer_dispatched_x, M * cfg.top_k, C, stream);
             
             // Step 2g: Expert Grouped GEMMs (W1 and W2)
-            cublaslt_gemm_moe_w1_fwd(ws.layer_dispatched_x, lay.w1_weights[0], ws.layer_h1, M * cfg.top_k, C, cfg.hidden_dim, stream);
-            launch_fused_gelu_fwd(ws.layer_h1, ws.layer_act, M * cfg.top_k * cfg.hidden_dim, stream);
-            cublaslt_gemm_moe_w2_fwd(ws.layer_act, lay.w2_weights[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, stream);
+            if (cfg.use_fp8_moe) {
+                launch_quantize_bf16_to_fp8(ws.layer_dispatched_x, ws.layer_dispatched_x_fp8, 16.0f, M * cfg.top_k * C, stream);
+                cublaslt_gemm_moe_w1_fp8(ws.layer_dispatched_x_fp8, lay.w1_weights_fp8[0], ws.layer_h1, M * cfg.top_k, C, cfg.hidden_dim, 1.0f / (16.0f * 64.0f), stream);
+                launch_fused_gelu_bf16_to_fp8(ws.layer_h1, ws.layer_act_fp8, 16.0f, M * cfg.top_k * cfg.hidden_dim, stream);
+                cublaslt_gemm_moe_w2_fp8(ws.layer_act_fp8, lay.w2_weights_fp8[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, 1.0f / (16.0f * 64.0f), stream);
+            } else {
+                cublaslt_gemm_moe_w1_fwd(ws.layer_dispatched_x, lay.w1_weights[0], ws.layer_h1, M * cfg.top_k, C, cfg.hidden_dim, stream);
+                launch_fused_gelu_fwd(ws.layer_h1, ws.layer_act, M * cfg.top_k * cfg.hidden_dim, stream);
+                cublaslt_gemm_moe_w2_fwd(ws.layer_act, lay.w2_weights[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, stream);
+            }
             
             // Step 2h+2i: Fused MoE Scatter Combine + Residual 2 Addition (Single Memory Pass)
             launch_moe_scatter_combine_add_residual(
@@ -355,7 +402,12 @@ void run_interleaved_forward(
     // 3. Final RMSNorm & LM Head for both microsteps
     for (int ms = 0; ms < 2; ++ms) {
         launch_fused_rmsnorm_fwd(cur_x[ms], params.final_norm_weight, ws.final_norm_out_ms[ms], ws.final_rsqrt_ms[ms], M, C, eps, stream);
-        cublaslt_gemm_lm_head_fwd(ws.final_norm_out_ms[ms], params.lm_head_weight, ws.logits_ms[ms], M, C, cfg.vocab_pad, stream);
+        if (cfg.use_fp8_lm_head) {
+            launch_quantize_bf16_to_fp8(ws.final_norm_out_ms[ms], ws.final_norm_out_fp8_ms[ms], 16.0f, M * C, stream);
+            cublaslt_gemm_lm_head_fwd_fp8(ws.final_norm_out_fp8_ms[ms], params.lm_head_weight_fp8, ws.logits_ms[ms], M, C, cfg.vocab_pad, 1.0f / (16.0f * 64.0f), stream);
+        } else {
+            cublaslt_gemm_lm_head_fwd(ws.final_norm_out_ms[ms], params.lm_head_weight, ws.logits_ms[ms], M, C, cfg.vocab_pad, stream);
+        }
         
         launch_fused_cross_entropy_bwd(
             ws.logits_ms[ms], ws.targets_ms[ms], ws.d_logits_ms[ms], ws.loss_buffer,
@@ -383,8 +435,23 @@ void run_interleaved_backward(
     
     // 1. LM Head Backward & Final RMSNorm Backward for both microsteps
     for (int ms = 0; ms < 2; ++ms) {
-        cublaslt_gemm_lm_head_bwd_dx(ws.d_logits_ms[ms], params.lm_head_weight, ws.d_final_norm_out_ms[ms], M, cfg.vocab_pad, C, stream);
-        cublaslt_gemm_lm_head_bwd_dw(ws.d_logits_ms[ms], ws.final_norm_out_ms[ms], params.d_lm_head_weight, M, cfg.vocab_pad, C, stream);
+        float beta = (ms == 0 ? 0.0f : 1.0f);
+        if (cfg.use_fp8_lm_head_backward) {
+            float scale_dlog = 1048576.0f; // 2^20
+            float scale_w = 64.0f;
+            float scale_fn = 16.0f;
+            launch_quantize_bf16_to_fp8(ws.d_logits_ms[ms], ws.d_logits_fp8_ms[ms], scale_dlog, M * cfg.vocab_pad, stream);
+            if (!cfg.use_fp8_lm_head) {
+                launch_quantize_bf16_to_fp8(ws.final_norm_out_ms[ms], ws.final_norm_out_fp8_ms[ms], scale_fn, M * C, stream);
+            }
+            float alpha_dx = 1.0f / (scale_dlog * scale_w);
+            cublaslt_gemm_lm_head_bwd_dx_fp8(ws.d_logits_fp8_ms[ms], params.lm_head_weight_fp8, ws.d_final_norm_out_ms[ms], M, cfg.vocab_pad, C, alpha_dx, stream);
+            float alpha_dw = 1.0f / (scale_dlog * scale_fn);
+            cublaslt_gemm_lm_head_bwd_dw_fp8(ws.d_logits_fp8_ms[ms], ws.final_norm_out_fp8_ms[ms], params.d_lm_head_weight, M, cfg.vocab_pad, C, alpha_dw, beta, stream);
+        } else {
+            cublaslt_gemm_lm_head_bwd_dx(ws.d_logits_ms[ms], params.lm_head_weight, ws.d_final_norm_out_ms[ms], M, cfg.vocab_pad, C, stream);
+            cublaslt_gemm_lm_head_bwd_dw(ws.d_logits_ms[ms], ws.final_norm_out_ms[ms], params.d_lm_head_weight, M, cfg.vocab_pad, C, stream, beta);
+        }
         
         launch_fused_rmsnorm_bwd(
             ws.d_final_norm_out_ms[ms], ws.stashed_x_ms[ms][cfg.num_layers - 1], params.final_norm_weight,
@@ -409,8 +476,9 @@ void run_interleaved_backward(
                 ws.layer_rsqrt1, next_dx[ms], lay.d_norm1_weight, M, C, stream
             );
             
-            // Execute QKV dW slice 0 matmul once per microstep (accumulates in-place via beta=1.0f)
-            cublaslt_gemm_qkv_bwd_dw_slice(next_dx[ms], ws.stashed_x_ms[ms][l], lay.d_qkv_weight, M, C, stream);
+            // Execute QKV dW slice 0 matmul once per microstep (overwrites on ms0 via beta=0.0f, accumulates on ms1 via beta=1.0f)
+            float beta_qkv = (ms == 0 ? 0.0f : 1.0f);
+            cublaslt_gemm_qkv_bwd_dw_slice(next_dx[ms], ws.stashed_x_ms[ms][l], lay.d_qkv_weight, M, C, stream, beta_qkv);
             
             // Zero-overhead ping-pong gradient pointer swap (eliminates cudaMemcpyAsync)
             std::swap(cur_dx[ms], next_dx[ms]);
@@ -448,5 +516,10 @@ void run_native_training_step_interleaved(
     run_interleaved_forward(cfg, ws, params, stream);
     run_interleaved_backward(cfg, ws, params, stream);
     run_fused_optimizer_step(params, ws, cfg, lr, stream);
+    
+    // Phase 28: If FP8 LM Head is used (fwd or bwd), re-quantize lm_head_weight to guarantee NO stale buffers
+    if (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) {
+        launch_quantize_bf16_to_fp8(params.lm_head_weight, params.lm_head_weight_fp8, 64.0f, cfg.vocab_pad * cfg.C, stream);
+    }
 }
 
