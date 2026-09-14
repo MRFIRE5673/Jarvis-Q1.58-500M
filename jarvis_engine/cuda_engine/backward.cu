@@ -24,17 +24,24 @@ __global__ void fused_cross_entropy_bwd_kernel(
     int tid = threadIdx.x;
     int target = targets[row];
     const __nv_bfloat16* row_logits = logits + (size_t)row * vocab_pad;
-    __nv_bfloat16* row_dlogits = d_logits + (size_t)row * vocab_pad;
+    __nv_bfloat16* row_dlogits = d_logits ? (d_logits + (size_t)row * vocab_pad) : nullptr;
     __nv_fp8_e4m3* row_dlogits_fp8 = d_logits_fp8 ? (d_logits_fp8 + (size_t)row * vocab_pad) : nullptr;
     
-    // Pass 1: Online Softmax (Simultaneous global max and sum of exp in a single read pass)
+    // Pass 1: Vectorized Online Softmax (128-bit uint4 = 8 BF16 per load)
     float m_i = -1e30f;
     float d_i = 0.0f;
-    for (int col = tid; col < vocab_size; col += BLOCK_SIZE) {
-        float val = __bfloat162float(row_logits[col]);
-        float m_new = fmaxf(m_i, val);
-        d_i = d_i * expf(m_i - m_new) + expf(val - m_new);
-        m_i = m_new;
+    for (int col = tid * 8; col < vocab_size; col += BLOCK_SIZE * 8) {
+        uint4 raw = *reinterpret_cast<const uint4*>(row_logits + col);
+        const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(&raw);
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            if (col + k < vocab_size) {
+                float val = __bfloat162float(v[k]);
+                float m_new = fmaxf(m_i, val);
+                d_i = d_i * expf(m_i - m_new) + expf(val - m_new);
+                m_i = m_new;
+            }
+        }
     }
     
     // Warp-level online softmax reduction
@@ -87,23 +94,35 @@ __global__ void fused_cross_entropy_bwd_kernel(
         atomicAdd(loss_out, (ce_loss * loss_scale) / (float)M);
     }
     
-    // Pass 2: Analytical dLogits = (prob - 1(col == target)) * loss_scale / M
+    // Pass 2: Vectorized Analytical dLogits (128-bit uint4 reads, 64-bit uint2 FP8 writes)
     float norm_factor = loss_scale / (float)M;
-    for (int col = tid; col < vocab_pad; col += BLOCK_SIZE) {
-        if (col < vocab_size) {
-            float val = __bfloat162float(row_logits[col]);
-            float prob = expf(val - global_max) * inv_sum_exp;
-            float grad = (col == target) ? (prob - 1.0f) : prob;
-            float scaled_grad = grad * norm_factor;
-            row_dlogits[col] = __float2bfloat16(scaled_grad);
-            if (row_dlogits_fp8) {
-                row_dlogits_fp8[col] = __nv_fp8_e4m3(scaled_grad * scale_fp8);
+    for (int col = tid * 8; col < vocab_pad; col += BLOCK_SIZE * 8) {
+        uint4 raw = *reinterpret_cast<const uint4*>(row_logits + col);
+        const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(&raw);
+        
+        __nv_bfloat16 out_bf16[8];
+        __nv_fp8_e4m3 out_fp8[8];
+        
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            int c = col + k;
+            if (c < vocab_size) {
+                float val = __bfloat162float(v[k]);
+                float prob = expf(val - global_max) * inv_sum_exp;
+                float grad = (c == target) ? (prob - 1.0f) : prob;
+                float scaled_grad = grad * norm_factor;
+                out_bf16[k] = __float2bfloat16(scaled_grad);
+                out_fp8[k] = __nv_fp8_e4m3(scaled_grad * scale_fp8);
+            } else {
+                out_bf16[k] = __float2bfloat16(0.0f);
+                out_fp8[k] = __nv_fp8_e4m3(0.0f);
             }
-        } else {
-            row_dlogits[col] = __float2bfloat16(0.0f); // Padded columns have zero gradient
-            if (row_dlogits_fp8) {
-                row_dlogits_fp8[col] = __nv_fp8_e4m3(0.0f);
-            }
+        }
+        if (row_dlogits) {
+            *reinterpret_cast<uint4*>(row_dlogits + col) = *reinterpret_cast<uint4*>(out_bf16);
+        }
+        if (row_dlogits_fp8) {
+            *reinterpret_cast<uint2*>(row_dlogits_fp8 + col) = *reinterpret_cast<uint2*>(out_fp8);
         }
     }
 }

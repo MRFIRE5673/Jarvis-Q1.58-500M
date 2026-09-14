@@ -232,7 +232,9 @@ void run_full_model_forward(
     
     // 5. Fused Cross-Entropy Loss and Analytical dLogits (Phase 31: writes d_logits_fp8 directly from registers)
     launch_fused_cross_entropy_bwd(
-        ws.logits, ws.targets, ws.d_logits, ws.loss_buffer,
+        ws.logits, ws.targets,
+        cfg.use_fp8_lm_head_backward ? nullptr : ws.d_logits,
+        ws.loss_buffer,
         M, cfg.vocab_size, cfg.vocab_pad, 1.0f / (float)cfg.accum_steps, stream,
         (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) ? ws.d_logits_fp8 : nullptr,
         1048576.0f
@@ -517,7 +519,9 @@ void run_interleaved_forward(
         
         // Phase 31: writes d_logits_fp8_ms[ms] directly from registers
         launch_fused_cross_entropy_bwd(
-            ws.logits_ms[ms], ws.targets_ms[ms], ws.d_logits_ms[ms], ws.loss_buffer,
+            ws.logits_ms[ms], ws.targets_ms[ms],
+            cfg.use_fp8_lm_head_backward ? nullptr : ws.d_logits_ms[ms],
+            ws.loss_buffer,
             M, cfg.vocab_size, cfg.vocab_pad, 1.0f / (float)cfg.accum_steps, stream,
             (cfg.use_fp8_lm_head || cfg.use_fp8_lm_head_backward) ? ws.d_logits_fp8_ms[ms] : nullptr,
             1048576.0f
