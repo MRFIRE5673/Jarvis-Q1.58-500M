@@ -27,6 +27,7 @@ struct FullJarvisConfig {
     bool use_bf16_moments = false;        // Phase 29: Native BF16 moments optimizer state toggle (14 B/elem)
     bool use_fp8_qkv = false;             // Phase 30: Native FP8 QKV forward toggle
     bool use_fused_rmsnorm_quant = true;  // Phase 31: Native Fused RMSNorm + FP8 Activation Quantization toggle
+    bool use_fp8_qkv_backward = true;     // Phase 31: Native FP8 QKV backward toggle
     
     int M() const { return B * T; }                     // 2048 tokens per microstep
     int total_tokens_per_step() const { return B * T * accum_steps; } // 4096 tokens
@@ -109,6 +110,7 @@ struct FullModelWorkspace {
     // Stashing only 24 layer input hidden states requires only:
     // 24 * 2048 * 1024 * 2 bytes = 100.66 MiB!
     __nv_bfloat16* stashed_x[24];    // 24 pointers to (M, C) buffers
+    __nv_fp8_e4m3* stashed_x_fp8[24];// 24 pointers to (M, C) FP8 buffers
     
     // 3. Reusable Active Layer Workspace (Shared across all 24 layers sequentially)
     __nv_bfloat16* layer_x_norm1;    // (M, C)
@@ -151,6 +153,7 @@ struct FullModelWorkspace {
     __nv_fp8_e4m3* d_logits_fp8;     // (M, vocab_pad) FP8 E4M3
     __nv_bfloat16* d_final_norm_out; // (M, C)
     __nv_bfloat16* d_layer_x;        // (M, C) ping-pong buffer A
+    __nv_fp8_e4m3* d_layer_x_fp8;    // (M, C) FP8 buffer for QKV backward
     __nv_bfloat16* d_layer_x_prev;   // (M, C) ping-pong buffer B
     __nv_bfloat16* d_layer_x1;       // (M, C)
     __nv_bfloat16* d_layer_attn_out; // (M, C)
@@ -170,6 +173,7 @@ struct FullModelWorkspace {
     int32_t*       targets_ms[2];
     __nv_bfloat16* emb_out_ms[2];
     __nv_bfloat16* stashed_x_ms[2][24];
+    __nv_fp8_e4m3* stashed_x_fp8_ms[2][24];
     __nv_bfloat16* layer_x2_ms[2];
     __nv_bfloat16* final_norm_out_ms[2];
     __nv_fp8_e4m3* final_norm_out_fp8_ms[2];
@@ -179,6 +183,7 @@ struct FullModelWorkspace {
     __nv_fp8_e4m3* d_logits_fp8_ms[2];
     __nv_bfloat16* d_final_norm_out_ms[2];
     __nv_bfloat16* d_layer_x_ms[2];
+    __nv_fp8_e4m3* d_layer_x_fp8_ms[2];
     __nv_bfloat16* d_layer_x_prev_ms[2];
     
     // 7. EXP-24-010 Consolidated Grouped AdamW Pointer Tables

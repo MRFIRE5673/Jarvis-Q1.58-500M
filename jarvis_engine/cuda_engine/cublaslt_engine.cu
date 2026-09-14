@@ -78,6 +78,7 @@ static cublasLtMatrixLayout_t g_layout_d_x_tn = nullptr;
 static cublasLtMatrixLayout_t g_layout_stashed_x_tn = nullptr;
 static cublasLtMatrixLayout_t g_layout_d_qkv_slice_tn = nullptr;
 static cublasLtMatmulAlgo_t g_algo_qkv_bwd_slice;
+static cublasLtMatmulAlgo_t g_algo_qkv_bwd_slice_fp8;
 
 static cublasLtMatmulAlgo_t autotune_matmul_algo(
     cublasLtHandle_t lt,
@@ -302,6 +303,13 @@ void init_cublaslt_engine(size_t workspace_bytes) {
     cublasLtMatrixLayoutCreate(&g_layout_d_x_tn, CUDA_R_16BF, 1024, 2048, 1024);
     cublasLtMatrixLayoutCreate(&g_layout_d_qkv_slice_tn, CUDA_R_16BF, 1024, 1024, 1024);
     g_algo_qkv_bwd_slice = autotune_matmul_algo(g_lt, g_desc_tn, g_layout_stashed_x_tn, g_layout_d_x_tn, g_layout_d_qkv_slice_tn, g_layout_d_qkv_slice_tn, pref, d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 1.0f, g_ws, g_ws_size, "QKV Bwd dSlice", 2);
+    
+    // I2. Phase 31: FP8 QKV Bwd dSlice: C (1024 x 1024) += A^T (2048 x 1024).T * B (2048 x 1024) in FP8
+    g_algo_qkv_bwd_slice_fp8 = autotune_matmul_algo(
+        g_lt, g_desc_tn_fp8, g_layout_x_2048_1024_fp8, g_layout_x_2048_1024_fp8,
+        g_layout_d_qkv_slice_tn, g_layout_d_qkv_slice_tn, pref,
+        d_scratchA, d_scratchB, d_scratchC, d_scratchC, 1.0f, 1.0f, g_ws, g_ws_size, "QKV Bwd dSlice FP8", 1
+    );
     
     cudaFree(d_scratchA);
     cudaFree(d_scratchB);
@@ -568,6 +576,18 @@ void cublaslt_gemm_qkv_bwd_dw_slice(
         g_lt, g_desc_tn, &alpha, stashed_x, g_layout_stashed_x_tn, d_x_norm, g_layout_d_x_tn,
         &beta, d_slice, g_layout_d_qkv_slice_tn, d_slice, g_layout_d_qkv_slice_tn,
         &g_algo_qkv_bwd_slice, g_ws, g_ws_size, stream
+    );
+}
+
+void cublaslt_gemm_qkv_bwd_dw_slice_fp8(
+    const __nv_fp8_e4m3* d_x_norm_fp8, const __nv_fp8_e4m3* stashed_x_fp8, __nv_bfloat16* d_slice,
+    int M, int C, float alpha, float beta, cudaStream_t stream
+) {
+    cublasLtMatmul(
+        g_lt, g_desc_tn_fp8, &alpha, stashed_x_fp8, g_layout_x_2048_1024_fp8,
+        d_x_norm_fp8, g_layout_x_2048_1024_fp8, &beta,
+        d_slice, g_layout_d_qkv_slice_tn, d_slice, g_layout_d_qkv_slice_tn,
+        &g_algo_qkv_bwd_slice_fp8, g_ws, g_ws_size, stream
     );
 }
 

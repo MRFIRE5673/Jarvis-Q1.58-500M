@@ -23,7 +23,8 @@ void launch_fused_add_rmsnorm_fwd(
 void launch_fused_rmsnorm_bwd(
     const __nv_bfloat16* grad_out, const __nv_bfloat16* x, const __nv_bfloat16* weight,
     const float* rsqrt, __nv_bfloat16* grad_x, __nv_bfloat16* grad_weight,
-    int M, int C, cudaStream_t stream
+    int M, int C, cudaStream_t stream,
+    __nv_fp8_e4m3* grad_x_fp8 = nullptr, float scale_fp8 = 1.0f
 );
 
 void launch_fused_gelu_fwd(const __nv_bfloat16* in, __nv_bfloat16* out, int num_elements, cudaStream_t stream);
@@ -112,6 +113,9 @@ void run_full_model_forward(
         
         // Stash layer input for exact analytical backward recomputation (100.66 MB total across 24 layers)
         cudaMemcpyAsync(ws.stashed_x[l], cur_x, M * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+        if (cfg.use_fp8_qkv_backward) {
+            launch_quantize_bf16_to_fp8(cur_x, ws.stashed_x_fp8[l], 16.0f, M * C, stream);
+        }
         
         // Step 2a: Fused RMSNorm 1: cur_x -> ws.layer_x_norm1 (or direct FP8)
         if (cfg.use_fused_rmsnorm_quant && cfg.use_fp8_qkv) {
@@ -295,15 +299,25 @@ void run_full_model_backward(
     for (int l = cfg.num_layers - 1; l >= 0; --l) {
         auto& lay = params.layers[l];
         
-        // Analytical layer gradient computation using stashed input
         // Residual 2 backward: dX2 splits into dX1 and dMoeOut
-        launch_fused_rmsnorm_bwd(
-            cur_dx, ws.stashed_x[l], lay.norm1_weight,
-            ws.layer_rsqrt1, next_dx, lay.d_norm1_weight, M, C, stream
-        );
+        float scale_dx = 128.0f;
+        float scale_x = 16.0f;
+        float alpha_dw = 1.0f / (scale_x * scale_dx);
         
-        // QKV parameter gradient: compute slice 0 once (overwrites on step 0, accumulates on step 1), replicate to slice 1 and 2
-        cublaslt_gemm_qkv_bwd_dw_slice(next_dx, ws.stashed_x[l], lay.d_qkv_weight, M, C, stream, beta);
+        if (cfg.use_fp8_qkv_backward) {
+            launch_fused_rmsnorm_bwd(
+                cur_dx, ws.stashed_x[l], lay.norm1_weight,
+                ws.layer_rsqrt1, next_dx, lay.d_norm1_weight, M, C, stream,
+                ws.d_layer_x_fp8, scale_dx
+            );
+            cublaslt_gemm_qkv_bwd_dw_slice_fp8(ws.d_layer_x_fp8, ws.stashed_x_fp8[l], lay.d_qkv_weight, M, C, alpha_dw, beta, stream);
+        } else {
+            launch_fused_rmsnorm_bwd(
+                cur_dx, ws.stashed_x[l], lay.norm1_weight,
+                ws.layer_rsqrt1, next_dx, lay.d_norm1_weight, M, C, stream
+            );
+            cublaslt_gemm_qkv_bwd_dw_slice(next_dx, ws.stashed_x[l], lay.d_qkv_weight, M, C, stream, beta);
+        }
         replicate_qkv_dw_slices(lay.d_qkv_weight, C, stream);
         
         // Zero-overhead ping-pong gradient pointer swap (eliminates cudaMemcpyAsync)
@@ -405,6 +419,9 @@ void run_interleaved_forward(
         // Microstep 0 followed immediately by Microstep 1
         for (int ms = 0; ms < 2; ++ms) {
             cudaMemcpyAsync(ws.stashed_x_ms[ms][l], cur_x[ms], M * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+            if (cfg.use_fp8_qkv_backward) {
+                launch_quantize_bf16_to_fp8(cur_x[ms], ws.stashed_x_fp8_ms[ms][l], 16.0f, M * C, stream);
+            }
             
             // Step 2a: Fused RMSNorm 1
             if (cfg.use_fused_rmsnorm_quant && cfg.use_fp8_qkv) {
@@ -554,16 +571,27 @@ void run_interleaved_backward(
     for (int l = cfg.num_layers - 1; l >= 0; --l) {
         auto& lay = params.layers[l];
         
+        float scale_dx = 128.0f;
+        float scale_x = 16.0f;
+        float alpha_dw = 1.0f / (scale_x * scale_dx);
+        
         // Interleave MS0 then MS1: both accumulate into the same layer parameter buffers
         for (int ms = 0; ms < 2; ++ms) {
-            launch_fused_rmsnorm_bwd(
-                cur_dx[ms], ws.stashed_x_ms[ms][l], lay.norm1_weight,
-                ws.layer_rsqrt1, next_dx[ms], lay.d_norm1_weight, M, C, stream
-            );
-            
-            // Execute QKV dW slice 0 matmul once per microstep (overwrites on ms0 via beta=0.0f, accumulates on ms1 via beta=1.0f)
             float beta_qkv = (ms == 0 ? 0.0f : 1.0f);
-            cublaslt_gemm_qkv_bwd_dw_slice(next_dx[ms], ws.stashed_x_ms[ms][l], lay.d_qkv_weight, M, C, stream, beta_qkv);
+            if (cfg.use_fp8_qkv_backward) {
+                launch_fused_rmsnorm_bwd(
+                    cur_dx[ms], ws.stashed_x_ms[ms][l], lay.norm1_weight,
+                    ws.layer_rsqrt1, next_dx[ms], lay.d_norm1_weight, M, C, stream,
+                    ws.d_layer_x_fp8_ms[ms], scale_dx
+                );
+                cublaslt_gemm_qkv_bwd_dw_slice_fp8(ws.d_layer_x_fp8_ms[ms], ws.stashed_x_fp8_ms[ms][l], lay.d_qkv_weight, M, C, alpha_dw, beta_qkv, stream);
+            } else {
+                launch_fused_rmsnorm_bwd(
+                    cur_dx[ms], ws.stashed_x_ms[ms][l], lay.norm1_weight,
+                    ws.layer_rsqrt1, next_dx[ms], lay.d_norm1_weight, M, C, stream
+                );
+                cublaslt_gemm_qkv_bwd_dw_slice(next_dx[ms], ws.stashed_x_ms[ms][l], lay.d_qkv_weight, M, C, stream, beta_qkv);
+            }
             
             // Zero-overhead ping-pong gradient pointer swap (eliminates cudaMemcpyAsync)
             std::swap(cur_dx[ms], next_dx[ms]);

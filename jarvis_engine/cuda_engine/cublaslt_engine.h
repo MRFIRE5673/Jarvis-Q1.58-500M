@@ -89,5 +89,10 @@ void cublaslt_gemm_qkv_bwd_dw_slice(
     int M, int C, cudaStream_t stream, float beta = 1.0f
 );
 
+void cublaslt_gemm_qkv_bwd_dw_slice_fp8(
+    const __nv_fp8_e4m3* d_x_norm_fp8, const __nv_fp8_e4m3* stashed_x_fp8, __nv_bfloat16* d_slice,
+    int M, int C, float alpha, float beta, cudaStream_t stream
+);
+
 // 128-bit vectorized replication of QKV dW slice 0 to slice 1 and slice 2
 void replicate_qkv_dw_slices(__nv_bfloat16* d_qkv_weight, int C, cudaStream_t stream);

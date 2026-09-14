@@ -280,7 +280,9 @@ __global__ void fused_rmsnorm_bwd_kernel(
     const float* __restrict__ rsqrt_in,
     __nv_bfloat16* __restrict__ grad_x,
     __nv_bfloat16* __restrict__ grad_weight,
-    int M, int C
+    int M, int C,
+    __nv_fp8_e4m3* __restrict__ grad_x_fp8 = nullptr,
+    float scale_fp8 = 1.0f
 ) {
     int row = blockIdx.x;
     if (row >= M) return;
@@ -289,6 +291,7 @@ __global__ void fused_rmsnorm_bwd_kernel(
     const __nv_bfloat16* row_gy = grad_out + row * C;
     const __nv_bfloat16* row_x = x + row * C;
     __nv_bfloat16* row_gx = grad_x + row * C;
+    __nv_fp8_e4m3* row_gx_fp8 = grad_x_fp8 ? (grad_x_fp8 + row * C) : nullptr;
     float rsqrt_val = rsqrt_in[row];
     
     float sum_x_w_gy = 0.0f;
@@ -327,6 +330,9 @@ __global__ void fused_rmsnorm_bwd_kernel(
         float wi = __bfloat162float(weight[col]);
         float dxi = rsqrt_val * wi * gy - coeff * xi;
         row_gx[col] = __float2bfloat16(dxi);
+        if (row_gx_fp8) {
+            row_gx_fp8[col] = __nv_fp8_e4m3(dxi * scale_fp8);
+        }
     }
 }
 
@@ -338,11 +344,13 @@ void launch_fused_rmsnorm_bwd(
     __nv_bfloat16* grad_x,
     __nv_bfloat16* grad_weight,
     int M, int C,
-    cudaStream_t stream
+    cudaStream_t stream,
+    __nv_fp8_e4m3* grad_x_fp8,
+    float scale_fp8
 ) {
     const int BLOCK_SIZE = 256;
     fused_rmsnorm_bwd_kernel<BLOCK_SIZE><<<M, BLOCK_SIZE, 0, stream>>>(
-        grad_out, x, weight, rsqrt, grad_x, grad_weight, M, C
+        grad_out, x, weight, rsqrt, grad_x, grad_weight, M, C, grad_x_fp8, scale_fp8
     );
 }
 

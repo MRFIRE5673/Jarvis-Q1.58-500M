@@ -61,6 +61,7 @@ FullModelWorkspace allocate_full_workspace(const FullJarvisConfig& cfg) {
         alloc_fp8(ws.d_logits_fp8_ms[ms], (size_t)M * vocab_pad);
         alloc_bf16(ws.d_final_norm_out_ms[ms], M * C);
         alloc_bf16(ws.d_layer_x_ms[ms], M * C);
+        alloc_fp8(ws.d_layer_x_fp8_ms[ms], M * C);
         alloc_bf16(ws.d_layer_x_prev_ms[ms], M * C);
     }
     // Backward compatibility aliasing
@@ -75,17 +76,20 @@ FullModelWorkspace allocate_full_workspace(const FullJarvisConfig& cfg) {
     ws.d_logits_fp8 = ws.d_logits_fp8_ms[0];
     ws.d_final_norm_out = ws.d_final_norm_out_ms[0];
     ws.d_layer_x = ws.d_layer_x_ms[0];
+    ws.d_layer_x_fp8 = ws.d_layer_x_fp8_ms[0];
     ws.d_layer_x_prev = ws.d_layer_x_prev_ms[0];
     
     // 2. Stashed Layer Inputs for Zero-Overhead Activation Recomputation
-    // 2 microsteps * 24 layers * (M, C) BF16
+    // 2 microsteps * 24 layers * (M, C) BF16 + FP8
     for (int ms = 0; ms < 2; ++ms) {
         for (int l = 0; l < cfg.num_layers; ++l) {
             alloc_bf16(ws.stashed_x_ms[ms][l], M * C);
+            alloc_fp8(ws.stashed_x_fp8_ms[ms][l], M * C);
         }
     }
     for (int l = 0; l < cfg.num_layers; ++l) {
         ws.stashed_x[l] = ws.stashed_x_ms[0][l];
+        ws.stashed_x_fp8[l] = ws.stashed_x_fp8_ms[0][l];
         alloc_bf16(ws.layer_h_last[l], cfg.B * C);
     }
     
@@ -173,9 +177,11 @@ void free_full_workspace(FullModelWorkspace& ws) {
         free_p((void*&)ws.d_logits_fp8_ms[ms]);
         free_p((void*&)ws.d_final_norm_out_ms[ms]);
         free_p((void*&)ws.d_layer_x_ms[ms]);
+        free_p((void*&)ws.d_layer_x_fp8_ms[ms]);
         free_p((void*&)ws.d_layer_x_prev_ms[ms]);
         for (int l = 0; l < 24; ++l) {
             free_p((void*&)ws.stashed_x_ms[ms][l]);
+            free_p((void*&)ws.stashed_x_fp8_ms[ms][l]);
         }
     }
     

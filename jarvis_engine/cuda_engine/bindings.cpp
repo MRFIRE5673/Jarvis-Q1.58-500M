@@ -439,5 +439,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_fp8_qkv", []() { return g_cfg.use_fp8_qkv; }, "Phase 30: Query native FP8 QKV forward status");
     m.def("set_fused_rmsnorm_quant", [](bool enabled) { g_cfg.use_fused_rmsnorm_quant = enabled; }, "Phase 31: Toggle native fused RMSNorm + FP8 quant");
     m.def("get_fused_rmsnorm_quant", []() { return g_cfg.use_fused_rmsnorm_quant; }, "Phase 31: Query native fused RMSNorm + FP8 quant status");
+    m.def("set_fp8_qkv_backward", [](bool enabled) { g_cfg.use_fp8_qkv_backward = enabled; }, "Phase 31: Toggle native FP8 QKV backward execution");
+    m.def("get_fp8_qkv_backward", []() { return g_cfg.use_fp8_qkv_backward; }, "Phase 31: Query native FP8 QKV backward status");
 }
 

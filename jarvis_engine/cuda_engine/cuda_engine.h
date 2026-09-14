@@ -107,7 +107,9 @@ void launch_fused_rmsnorm_bwd(
     __nv_bfloat16* grad_x,
     __nv_bfloat16* grad_weight,
     int M, int C,
-    cudaStream_t stream
+    cudaStream_t stream,
+    __nv_fp8_e4m3* grad_x_fp8 = nullptr,
+    float scale_fp8 = 1.0f
 );
 
 void launch_fused_gelu_fwd(
