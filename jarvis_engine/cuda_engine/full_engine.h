@@ -199,6 +199,12 @@ struct FullModelWorkspace {
     __nv_bfloat16* d_h1;             // (M * top_k, hidden_dim)
     __nv_bfloat16* d_dispatched_x;   // (M * top_k, C)
     float*         d_topk_gates;     // (M, top_k)
+    int32_t*       layer_expert_offsets; // (E + 1)
+    __nv_bfloat16* d_router_logits;  // (M, E)
+    __nv_bfloat16* dx_norm2_expert;  // (M, C)
+    __nv_bfloat16* dx_norm2;         // (M, C)
+    __nv_bfloat16* dx_norm2_in;      // (M, C)
+    __nv_bfloat16* dx1;              // (M, C)
     
     // Optimizer reduction workspace
     float*         grad_norm_sq;     // (1) Device reduction buffer for ||g||^2

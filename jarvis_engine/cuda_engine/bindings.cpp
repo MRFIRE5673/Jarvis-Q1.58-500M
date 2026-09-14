@@ -7,6 +7,7 @@
 #include "optimizer.h"
 #include "cublaslt_engine.h"
 #include "attention.h"
+#include "moe.h"
 #include <cuda_fp8.h>
 
 void launch_quantize_bf16_to_fp8(
@@ -489,6 +490,236 @@ std::vector<torch::Tensor> get_layer_gradients(int layer_idx) {
     return {d_qkv, d_out, d_norm1};
 }
 
+std::vector<torch::Tensor> get_all_layer_gradients(int layer_idx) {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    TORCH_CHECK(layer_idx >= 0 && layer_idx < g_cfg.num_layers, "Invalid layer index");
+    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    auto& lay = g_params.layers[layer_idx];
+    
+    std::vector<torch::Tensor> grads;
+    // 0: d_qkv (3 * C, C)
+    torch::Tensor d_qkv = torch::empty({3 * g_cfg.C, g_cfg.C}, opts);
+    cudaMemcpy(d_qkv.data_ptr(), lay.d_qkv_weight, 3 * g_cfg.C * g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    grads.push_back(d_qkv);
+    
+    // 1: d_out (C, C)
+    torch::Tensor d_out = torch::empty({g_cfg.C, g_cfg.C}, opts);
+    cudaMemcpy(d_out.data_ptr(), lay.d_out_proj_weight, g_cfg.C * g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    grads.push_back(d_out);
+    
+    // 2: d_norm1 (C)
+    torch::Tensor d_norm1 = torch::empty({g_cfg.C}, opts);
+    cudaMemcpy(d_norm1.data_ptr(), lay.d_norm1_weight, g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    grads.push_back(d_norm1);
+    
+    // 3: d_norm2 (C)
+    torch::Tensor d_norm2 = torch::empty({g_cfg.C}, opts);
+    cudaMemcpy(d_norm2.data_ptr(), lay.d_norm2_weight, g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    grads.push_back(d_norm2);
+    
+    // 4: d_router (E, C)
+    torch::Tensor d_router = torch::empty({g_cfg.E, g_cfg.C}, opts);
+    cudaMemcpy(d_router.data_ptr(), lay.d_router_weight, g_cfg.E * g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    grads.push_back(d_router);
+    
+    // 5..8: d_w1_0..3 (hidden_dim, C)
+    for (int e = 0; e < g_cfg.E; ++e) {
+        torch::Tensor dw1 = torch::empty({g_cfg.hidden_dim, g_cfg.C}, opts);
+        cudaMemcpy(dw1.data_ptr(), lay.d_w1_weights[e], g_cfg.hidden_dim * g_cfg.C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+        grads.push_back(dw1);
+    }
+    
+    // 9..12: d_w2_0..3 (C, hidden_dim)
+    for (int e = 0; e < g_cfg.E; ++e) {
+        torch::Tensor dw2 = torch::empty({g_cfg.C, g_cfg.hidden_dim}, opts);
+        cudaMemcpy(dw2.data_ptr(), lay.d_w2_weights[e], g_cfg.C * g_cfg.hidden_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+        grads.push_back(dw2);
+    }
+    
+    return grads;
+}
+
+// Component 4: Isolated MoE Forward Test Binding
+std::vector<torch::Tensor> test_moe_forward(torch::Tensor x1, int layer_idx, float noise_std) {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    TORCH_CHECK(layer_idx >= 0 && layer_idx < g_cfg.num_layers, "Invalid layer index");
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    auto& lay = g_params.layers[layer_idx];
+    int M = g_cfg.M();
+    int C = g_cfg.C;
+    int top_k = g_cfg.top_k;
+    int hidden_dim = g_cfg.hidden_dim;
+    int E = g_cfg.E;
+    
+    cudaMemcpyAsync(g_ws.layer_x1, x1.data_ptr(), (size_t)M * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+    launch_fused_rmsnorm_fwd(g_ws.layer_x1, lay.norm2_weight, g_ws.layer_x_norm2, g_ws.layer_rsqrt2, M, C, 1e-6f, stream);
+    
+    cublaslt_gemm_router_fwd(g_ws.layer_x_norm2, lay.router_weight, g_ws.layer_router_logits, M, C, E, stream);
+    launch_moe_top2_gating(g_ws.layer_router_logits, g_ws.layer_topk_gates, g_ws.layer_topk_idx, g_ws.l_bal_total, M, E, noise_std, noise_std > 0.0f, stream);
+    launch_moe_compute_maps(g_ws.layer_topk_idx, g_ws.layer_scatter_map, g_ws.layer_gather_map, g_ws.layer_gate_idx_map, g_ws.layer_expert_offsets, M, E, stream);
+    launch_moe_dispatch_gather(g_ws.layer_x_norm2, g_ws.layer_gather_map, g_ws.layer_dispatched_x, M * top_k, C, stream);
+    launch_moe_grouped_gemm_fwd_w1(g_ws.layer_dispatched_x, lay.w1_weights, g_ws.layer_expert_offsets, g_ws.layer_h1, M * top_k, C, hidden_dim, E, stream);
+    launch_fused_gelu_fwd(g_ws.layer_h1, g_ws.layer_act, M * top_k * hidden_dim, stream);
+    launch_moe_grouped_gemm_fwd_w2(g_ws.layer_act, lay.w2_weights, g_ws.layer_expert_offsets, g_ws.layer_dispatched_y, M * top_k, hidden_dim, C, E, stream);
+    launch_moe_scatter_combine_add_residual(g_ws.layer_dispatched_y, g_ws.layer_topk_gates, g_ws.layer_scatter_map, g_ws.layer_x1, g_ws.layer_moe_out, M, C, stream);
+    cudaStreamSynchronize(stream);
+    
+    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    auto opts_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    
+    torch::Tensor out = torch::empty({M, C}, opts_bf16);
+    cudaMemcpy(out.data_ptr(), g_ws.layer_moe_out, (size_t)M * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    
+    torch::Tensor gates = torch::empty({M, top_k}, opts_f32);
+    cudaMemcpy(gates.data_ptr(), g_ws.layer_topk_gates, (size_t)M * top_k * sizeof(float), cudaMemcpyDeviceToDevice);
+    
+    torch::Tensor top_idx = torch::empty({M, top_k}, opts_i32);
+    cudaMemcpy(top_idx.data_ptr(), g_ws.layer_topk_idx, (size_t)M * top_k * sizeof(int32_t), cudaMemcpyDeviceToDevice);
+    
+    torch::Tensor offsets = torch::empty({E + 1}, opts_i32);
+    cudaMemcpy(offsets.data_ptr(), g_ws.layer_expert_offsets, (size_t)(E + 1) * sizeof(int32_t), cudaMemcpyDeviceToDevice);
+    
+    torch::Tensor logits = torch::empty({M, E}, opts_bf16);
+    cudaMemcpy(logits.data_ptr(), g_ws.layer_router_logits, (size_t)M * E * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    
+    torch::Tensor x_norm2 = torch::empty({M, C}, opts_bf16);
+    cudaMemcpy(x_norm2.data_ptr(), g_ws.layer_x_norm2, (size_t)M * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    
+    return {out, gates, top_idx, offsets, logits, x_norm2};
+}
+
+// Component 4: Isolated MoE Backward Test Binding
+std::vector<torch::Tensor> test_moe_backward(torch::Tensor grad_out, int layer_idx) {
+    TORCH_CHECK(g_engine_initialized, "Engine not initialized");
+    TORCH_CHECK(layer_idx >= 0 && layer_idx < g_cfg.num_layers, "Invalid layer index");
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    auto& lay = g_params.layers[layer_idx];
+    int M = g_cfg.M();
+    int C = g_cfg.C;
+    int top_k = g_cfg.top_k;
+    int hidden_dim = g_cfg.hidden_dim;
+    int E = g_cfg.E;
+    
+    // Zero gradients before backward for clean measurement
+    cudaMemsetAsync(lay.d_norm2_weight, 0, C * sizeof(__nv_bfloat16), stream);
+    cudaMemsetAsync(lay.d_router_weight, 0, E * C * sizeof(__nv_bfloat16), stream);
+    for (int e = 0; e < E; ++e) {
+        cudaMemsetAsync(lay.d_w1_weights[e], 0, hidden_dim * C * sizeof(__nv_bfloat16), stream);
+        cudaMemsetAsync(lay.d_w2_weights[e], 0, C * hidden_dim * sizeof(__nv_bfloat16), stream);
+    }
+    
+    const __nv_bfloat16* grad_out_ptr = reinterpret_cast<const __nv_bfloat16*>(grad_out.data_ptr<at::BFloat16>());
+    
+    // 1. Scatter backward: grad_out -> d_dispatched_y, d_topk_gates
+    launch_moe_scatter_backward(
+        grad_out_ptr, g_ws.layer_dispatched_y, g_ws.layer_topk_gates,
+        g_ws.layer_gather_map, g_ws.layer_gate_idx_map, g_ws.layer_scatter_map,
+        g_ws.d_dispatched_y, g_ws.d_topk_gates,
+        M, M * top_k, C, stream
+    );
+    
+    // 2. Grouped W2 backward: d_dispatched_y, act -> dW2, d_act
+    launch_moe_grouped_gemm_w2_bwd(
+        g_ws.d_dispatched_y, g_ws.layer_act, lay.w2_weights,
+        g_ws.layer_expert_offsets, lay.d_w2_weights, g_ws.d_act,
+        M * top_k, hidden_dim, C, E, 0.0f, stream
+    );
+    
+    // 3. Fused GELU backward: d_act, h1 -> d_h1
+    launch_fused_gelu_bwd(g_ws.d_act, g_ws.layer_h1, g_ws.d_h1, M * top_k * hidden_dim, stream);
+    
+    // 4. Grouped W1 backward: d_h1, dispatched_x -> dW1, d_dispatched_x
+    launch_moe_grouped_gemm_w1_bwd(
+        g_ws.d_h1, g_ws.layer_dispatched_x, lay.w1_weights,
+        g_ws.layer_expert_offsets, lay.d_w1_weights, g_ws.d_dispatched_x,
+        M * top_k, C, hidden_dim, E, 0.0f, stream
+    );
+    
+    // 5. Gather backward: d_dispatched_x -> dx_norm2_expert
+    launch_moe_gather_backward(
+        g_ws.d_dispatched_x, g_ws.layer_scatter_map, g_ws.dx_norm2_expert,
+        M, top_k, C, stream
+    );
+    
+    // 6. Router backward: d_topk_gates -> d_router_logits
+    launch_moe_router_backward(
+        g_ws.d_topk_gates, g_ws.layer_router_logits, g_ws.layer_topk_idx,
+        g_ws.d_router_logits, M, E, stream
+    );
+    
+    // 7. Router GEMMs backward: d_router_logits -> d_router_weight, dx_norm2
+    launch_moe_router_gemms_bwd(
+        g_ws.d_router_logits, g_ws.layer_x_norm2, lay.router_weight,
+        g_ws.dx_norm2_expert, lay.d_router_weight, g_ws.dx_norm2,
+        M, C, E, 0.0f, stream
+    );
+    
+    // 8. RMSNorm 2 backward: dx_norm2 -> dx_norm2_in, d_norm2_weight
+    launch_fused_rmsnorm_bwd(
+        g_ws.dx_norm2, g_ws.layer_x1, lay.norm2_weight,
+        g_ws.layer_rsqrt2, g_ws.dx_norm2_in, lay.d_norm2_weight, M, C, stream
+    );
+    
+    // 9. Residual 2 addition: cur_dx + dx_norm2_in -> dx1
+    launch_fused_add_residual(grad_out_ptr, g_ws.dx_norm2_in, g_ws.dx1, M * C, stream);
+    
+    cudaStreamSynchronize(stream);
+    
+    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    
+    std::vector<torch::Tensor> res;
+    // 0..3: expert dW1 [0..3]
+    for (int e = 0; e < E; ++e) {
+        torch::Tensor dw1 = torch::empty({hidden_dim, C}, opts_bf16);
+        cudaMemcpy(dw1.data_ptr(), lay.d_w1_weights[e], (size_t)hidden_dim * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+        res.push_back(dw1);
+    }
+    // 4..7: expert dW2 [0..3]
+    for (int e = 0; e < E; ++e) {
+        torch::Tensor dw2 = torch::empty({C, hidden_dim}, opts_bf16);
+        cudaMemcpy(dw2.data_ptr(), lay.d_w2_weights[e], (size_t)C * hidden_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+        res.push_back(dw2);
+    }
+    // 8: d_router_weight (E, C)
+    torch::Tensor d_rw = torch::empty({E, C}, opts_bf16);
+    cudaMemcpy(d_rw.data_ptr(), lay.d_router_weight, (size_t)E * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    res.push_back(d_rw);
+    
+    // 9: dx_norm2 (M, C)
+    torch::Tensor dx_n2 = torch::empty({M, C}, opts_bf16);
+    cudaMemcpy(dx_n2.data_ptr(), g_ws.dx_norm2, (size_t)M * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    res.push_back(dx_n2);
+    
+    // 10: dx_norm2_in (M, C)
+    torch::Tensor dx_n2_in = torch::empty({M, C}, opts_bf16);
+    cudaMemcpy(dx_n2_in.data_ptr(), g_ws.dx_norm2_in, (size_t)M * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    res.push_back(dx_n2_in);
+    
+    // 11: dx1 (M, C)
+    torch::Tensor dx1 = torch::empty({M, C}, opts_bf16);
+    cudaMemcpy(dx1.data_ptr(), g_ws.dx1, (size_t)M * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    res.push_back(dx1);
+    
+    // 12: d_router_logits (M, E)
+    torch::Tensor d_rl = torch::empty({M, E}, opts_bf16);
+    cudaMemcpy(d_rl.data_ptr(), g_ws.d_router_logits, (size_t)M * E * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    res.push_back(d_rl);
+    
+    // 13: d_topk_gates (M, top_k)
+    torch::Tensor d_tg = torch::empty({M, top_k}, opts_f32);
+    cudaMemcpy(d_tg.data_ptr(), g_ws.d_topk_gates, (size_t)M * top_k * sizeof(float), cudaMemcpyDeviceToDevice);
+    res.push_back(d_tg);
+    
+    // 14: d_norm2_weight (C)
+    torch::Tensor d_n2_w = torch::empty({C}, opts_bf16);
+    cudaMemcpy(d_n2_w.data_ptr(), lay.d_norm2_weight, (size_t)C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+    res.push_back(d_n2_w);
+    
+    return res;
+}
+
 // ---------------------------------------------------------------------------
 // PyBind11 Module Exports
 // ---------------------------------------------------------------------------
@@ -535,5 +766,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("test_attention_backward", &test_attention_backward, "Component 3: Test native attention backward");
     m.def("test_attention_forward", &test_attention_forward, "Component 3: Test native attention forward");
     m.def("get_layer_gradients", &get_layer_gradients, "Component 3: Get layer parameter gradients");
+    m.def("get_all_layer_gradients", &get_all_layer_gradients, "Component 4: Get all layer parameter gradients including MoE");
+    m.def("test_moe_forward", &test_moe_forward, "Component 4: Test native MoE forward");
+    m.def("test_moe_backward", &test_moe_backward, "Component 4: Test native MoE backward");
 }
 

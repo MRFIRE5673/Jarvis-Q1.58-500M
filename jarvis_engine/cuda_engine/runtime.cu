@@ -180,6 +180,12 @@ FullModelWorkspace allocate_full_workspace(const FullJarvisConfig& cfg) {
     alloc_bf16(ws.d_h1, M * top_k * hidden_dim);
     alloc_bf16(ws.d_dispatched_x, M * top_k * C);
     alloc_f32(ws.d_topk_gates, M * top_k);
+    alloc_i32(ws.layer_expert_offsets, E + 1);
+    alloc_bf16(ws.d_router_logits, M * E);
+    alloc_bf16(ws.dx_norm2_expert, M * C);
+    alloc_bf16(ws.dx_norm2, M * C);
+    alloc_bf16(ws.dx_norm2_in, M * C);
+    alloc_bf16(ws.dx1, M * C);
     
     // Optimizer reduction buffer
     alloc_f32(ws.grad_norm_sq, 1);
@@ -309,6 +315,12 @@ void free_full_workspace(FullModelWorkspace& ws) {
     free_p((void*&)ws.d_dispatched_x);
 
     free_p((void*&)ws.d_topk_gates);
+    free_p((void*&)ws.layer_expert_offsets);
+    free_p((void*&)ws.d_router_logits);
+    free_p((void*&)ws.dx_norm2_expert);
+    free_p((void*&)ws.dx_norm2);
+    free_p((void*&)ws.dx_norm2_in);
+    free_p((void*&)ws.dx1);
     
     free_p((void*&)ws.grad_norm_sq);
     free_p((void*&)ws.clip_coef);

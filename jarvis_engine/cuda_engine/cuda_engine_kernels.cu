@@ -336,6 +336,30 @@ __global__ void fused_rmsnorm_bwd_kernel(
     }
 }
 
+__global__ void rmsnorm_bwd_dw_kernel(
+    const __nv_bfloat16* __restrict__ grad_out,
+    const __nv_bfloat16* __restrict__ x,
+    const float* __restrict__ rsqrt_in,
+    __nv_bfloat16* __restrict__ grad_weight,
+    int M, int C, float beta
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    
+    float acc = 0.0f;
+    for (int m = 0; m < M; ++m) {
+        float gy = __bfloat162float(grad_out[(size_t)m * C + c]);
+        float xi = __bfloat162float(x[(size_t)m * C + c]);
+        float rsq = rsqrt_in[m];
+        acc += gy * xi * rsq;
+    }
+    if (beta == 0.0f) {
+        grad_weight[c] = __float2bfloat16(acc);
+    } else {
+        grad_weight[c] = __float2bfloat16(acc + __bfloat162float(grad_weight[c]));
+    }
+}
+
 void launch_fused_rmsnorm_bwd(
     const __nv_bfloat16* grad_out,
     const __nv_bfloat16* x,
@@ -346,12 +370,20 @@ void launch_fused_rmsnorm_bwd(
     int M, int C,
     cudaStream_t stream,
     __nv_fp8_e4m3* grad_x_fp8,
-    float scale_fp8
+    float scale_fp8,
+    float beta
 ) {
     const int BLOCK_SIZE = 256;
     fused_rmsnorm_bwd_kernel<BLOCK_SIZE><<<M, BLOCK_SIZE, 0, stream>>>(
         grad_out, x, weight, rsqrt, grad_x, grad_weight, M, C, grad_x_fp8, scale_fp8
     );
+    if (grad_weight) {
+        const int BLOCK = 256;
+        int grid = (C + BLOCK - 1) / BLOCK;
+        rmsnorm_bwd_dw_kernel<<<grid, BLOCK, 0, stream>>>(
+            grad_out, x, rsqrt, grad_weight, M, C, beta
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

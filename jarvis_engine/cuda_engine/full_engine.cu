@@ -2,6 +2,7 @@
 #include "optimizer.h"
 #include "cublaslt_engine.h"
 #include "attention.h"
+#include "moe.h"
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -25,7 +26,8 @@ void launch_fused_rmsnorm_bwd(
     const __nv_bfloat16* grad_out, const __nv_bfloat16* x, const __nv_bfloat16* weight,
     const float* rsqrt, __nv_bfloat16* grad_x, __nv_bfloat16* grad_weight,
     int M, int C, cudaStream_t stream,
-    __nv_fp8_e4m3* grad_x_fp8 = nullptr, float scale_fp8 = 1.0f
+    __nv_fp8_e4m3* grad_x_fp8 = nullptr, float scale_fp8 = 1.0f,
+    float beta = 0.0f
 );
 
 void launch_fused_gelu_fwd(const __nv_bfloat16* in, __nv_bfloat16* out, int num_elements, cudaStream_t stream);
@@ -39,8 +41,9 @@ void launch_fused_cross_entropy_bwd(
 );
 
 void launch_tok_emb_fwd(
-    const int32_t* input_ids, const __nv_bfloat16* emb_weight, __nv_bfloat16* out,
-    int M, int C, cudaStream_t stream
+    const int32_t* input_ids, const __nv_bfloat16* emb_weight,
+    __nv_bfloat16* out, int M, int C, cudaStream_t stream,
+    __nv_fp8_e4m3* out_fp8 = nullptr, float scale_fp8 = 16.0f
 );
 
 void launch_tok_emb_bwd(
@@ -48,41 +51,9 @@ void launch_tok_emb_bwd(
     int M, int C, cudaStream_t stream
 );
 
-void launch_moe_top2_gating(
-    const __nv_bfloat16* logits, float* topk_gates, int32_t* topk_idx, float* l_bal,
-    int M, int E, float noise_std, bool training, cudaStream_t stream
-);
-
-void launch_moe_compute_maps(
-    const int32_t* topk_idx, int32_t* scatter_map, int32_t* gather_map, int32_t* gate_idx_map,
-    int M, int E, cudaStream_t stream
-);
-
-void launch_moe_dispatch_gather(
-    const __nv_bfloat16* x, const int32_t* gather_map, __nv_bfloat16* dispatched_x,
-    int total_dispatched, int C, cudaStream_t stream
-);
-
 void launch_moe_dispatch_gather_fp8(
     const __nv_fp8_e4m3* x_fp8, const int32_t* gather_map, __nv_fp8_e4m3* dispatched_x_fp8,
     int total_dispatched, int C, cudaStream_t stream
-);
-
-void launch_tok_emb_fwd(
-    const int32_t* input_ids, const __nv_bfloat16* emb_weight,
-    __nv_bfloat16* out, int M, int C, cudaStream_t stream,
-    __nv_fp8_e4m3* out_fp8 = nullptr, float scale_fp8 = 16.0f
-);
-
-void launch_moe_scatter_combine(
-    const __nv_bfloat16* dispatched_y, const float* topk_gates, const int32_t* scatter_map,
-    __nv_bfloat16* out, int M, int C, cudaStream_t stream
-);
-
-void launch_moe_scatter_combine_add_residual(
-    const __nv_bfloat16* dispatched_y, const float* topk_gates, const int32_t* scatter_map,
-    const __nv_bfloat16* x1, __nv_bfloat16* x2, int M, int C, cudaStream_t stream,
-    __nv_fp8_e4m3* x2_fp8 = nullptr, float scale_fp8 = 16.0f
 );
 
 // Phase 28: FP8 MoE Quantization & Fused GELU
@@ -170,7 +141,7 @@ void run_full_model_forward(
             M, cfg.E, 0.1f, true, stream
         );
         launch_moe_compute_maps(
-            ws.layer_topk_idx, ws.layer_scatter_map, ws.layer_gather_map, ws.layer_gate_idx_map,
+            ws.layer_topk_idx, ws.layer_scatter_map, ws.layer_gather_map, ws.layer_gate_idx_map, ws.layer_expert_offsets,
             M, cfg.E, stream
         );
         
@@ -197,9 +168,15 @@ void run_full_model_forward(
                 ws.layer_x_norm2, ws.layer_gather_map, ws.layer_dispatched_x,
                 M * cfg.top_k, C, stream
             );
-            cublaslt_gemm_moe_w1_fwd(ws.layer_dispatched_x, lay.w1_weights[0], ws.layer_h1, M * cfg.top_k, C, cfg.hidden_dim, stream);
+            launch_moe_grouped_gemm_fwd_w1(
+                ws.layer_dispatched_x, lay.w1_weights, ws.layer_expert_offsets, ws.layer_h1,
+                M * cfg.top_k, C, cfg.hidden_dim, cfg.E, stream
+            );
             launch_fused_gelu_fwd(ws.layer_h1, ws.layer_act, M * cfg.top_k * cfg.hidden_dim, stream);
-            cublaslt_gemm_moe_w2_fwd(ws.layer_act, lay.w2_weights[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, stream);
+            launch_moe_grouped_gemm_fwd_w2(
+                ws.layer_act, lay.w2_weights, ws.layer_expert_offsets, ws.layer_dispatched_y,
+                M * cfg.top_k, cfg.hidden_dim, C, cfg.E, stream
+            );
         }
         
         // Step 2h+2i: Fused MoE Scatter Combine + Residual 2 Addition (Direct next-layer stashing!)
@@ -321,15 +298,106 @@ void run_full_model_backward(
         cublaslt_gemm_qkv_fwd(ws.layer_x_norm1, lay.qkv_weight, ws.layer_qkv, M, C, stream);
         run_native_associative_attention_forward(ws, lay, l, cfg, stream);
         
-        // 2. Analytical Associative Attention Backward:
+        launch_fused_add_rmsnorm_fwd(
+            ws.stashed_x[l], ws.layer_attn_out, lay.norm2_weight,
+            ws.layer_x1, ws.layer_x_norm2, ws.layer_rsqrt2,
+            M, C, 1e-6f, stream
+        );
+        cublaslt_gemm_router_fwd(ws.layer_x_norm2, lay.router_weight, ws.layer_router_logits, M, C, cfg.E, stream);
+        launch_moe_top2_gating(
+            ws.layer_router_logits, ws.layer_topk_gates, ws.layer_topk_idx, ws.l_bal_total,
+            M, cfg.E, 0.1f, true, stream
+        );
+        launch_moe_compute_maps(
+            ws.layer_topk_idx, ws.layer_scatter_map, ws.layer_gather_map, ws.layer_gate_idx_map, ws.layer_expert_offsets,
+            M, cfg.E, stream
+        );
+        launch_moe_dispatch_gather(
+            ws.layer_x_norm2, ws.layer_gather_map, ws.layer_dispatched_x,
+            M * cfg.top_k, C, stream
+        );
+        launch_moe_grouped_gemm_fwd_w1(
+            ws.layer_dispatched_x, lay.w1_weights, ws.layer_expert_offsets, ws.layer_h1,
+            M * cfg.top_k, C, cfg.hidden_dim, cfg.E, stream
+        );
+        launch_fused_gelu_fwd(ws.layer_h1, ws.layer_act, M * cfg.top_k * cfg.hidden_dim, stream);
+        launch_moe_grouped_gemm_fwd_w2(
+            ws.layer_act, lay.w2_weights, ws.layer_expert_offsets, ws.layer_dispatched_y,
+            M * cfg.top_k, cfg.hidden_dim, C, cfg.E, stream
+        );
+        
+        // 2a. MoE Scatter Backward:
+        // cur_dx (dL/dx2) -> ws.d_dispatched_y, ws.d_topk_gates
+        launch_moe_scatter_backward(
+            cur_dx, ws.layer_dispatched_y, ws.layer_topk_gates,
+            ws.layer_gather_map, ws.layer_gate_idx_map, ws.layer_scatter_map,
+            ws.d_dispatched_y, ws.d_topk_gates,
+            M, M * cfg.top_k, C, stream
+        );
+        
+        // 2b. MoE Grouped W2 Backward:
+        // ws.d_dispatched_y, ws.layer_act -> lay.d_w2_weights (with beta), ws.d_act
+        launch_moe_grouped_gemm_w2_bwd(
+            ws.d_dispatched_y, ws.layer_act, lay.w2_weights,
+            ws.layer_expert_offsets, lay.d_w2_weights, ws.d_act,
+            M * cfg.top_k, cfg.hidden_dim, C, cfg.E, beta, stream
+        );
+        
+        // 2c. Fused GELU Backward:
+        // ws.d_act, ws.layer_h1 -> ws.d_h1
+        launch_fused_gelu_bwd(ws.d_act, ws.layer_h1, ws.d_h1, M * cfg.top_k * cfg.hidden_dim, stream);
+        
+        // 2d. MoE Grouped W1 Backward:
+        // ws.d_h1, ws.layer_dispatched_x -> lay.d_w1_weights (with beta), ws.d_dispatched_x
+        launch_moe_grouped_gemm_w1_bwd(
+            ws.d_h1, ws.layer_dispatched_x, lay.w1_weights,
+            ws.layer_expert_offsets, lay.d_w1_weights, ws.d_dispatched_x,
+            M * cfg.top_k, C, cfg.hidden_dim, cfg.E, beta, stream
+        );
+        
+        // 2e. MoE Gather Backward:
+        // ws.d_dispatched_x -> ws.dx_norm2_expert
+        launch_moe_gather_backward(
+            ws.d_dispatched_x, ws.layer_scatter_map, ws.dx_norm2_expert,
+            M, cfg.top_k, C, stream
+        );
+        
+        // 2f. MoE Router Backward:
+        // ws.d_topk_gates, ws.layer_router_logits, ws.layer_topk_idx -> ws.d_router_logits
+        launch_moe_router_backward(
+            ws.d_topk_gates, ws.layer_router_logits, ws.layer_topk_idx,
+            ws.d_router_logits, M, cfg.E, stream
+        );
+        
+        // 2g. MoE Router GEMMs Backward & Norm2 Input Combination:
+        // ws.d_router_logits, ws.layer_x_norm2 -> lay.d_router_weight (with beta)
+        // ws.d_router_logits @ router_weight + ws.dx_norm2_expert -> ws.dx_norm2
+        launch_moe_router_gemms_bwd(
+            ws.d_router_logits, ws.layer_x_norm2, lay.router_weight,
+            ws.dx_norm2_expert, lay.d_router_weight, ws.dx_norm2,
+            M, C, cfg.E, beta, stream
+        );
+        
+        // 2h. RMSNorm 2 Backward:
+        // ws.dx_norm2 -> ws.dx_norm2_in, lay.d_norm2_weight
+        launch_fused_rmsnorm_bwd(
+            ws.dx_norm2, ws.layer_x1, lay.norm2_weight,
+            ws.layer_rsqrt2, ws.dx_norm2_in, lay.d_norm2_weight, M, C, stream
+        );
+        
+        // 2i. Residual 2 Addition:
+        // ws.dx1 = cur_dx + ws.dx_norm2_in
+        launch_fused_add_residual(cur_dx, ws.dx_norm2_in, ws.dx1, M * C, stream);
+        
+        // 3. Analytical Associative Attention Backward:
         // Computes dW_out (accumulating into lay.d_out_proj_weight with beta)
         // and d_layer_qkv (M, 3 * C) with distinct dQ, dK, dV
         run_native_associative_attention_backward(
-            ws, lay, l, cfg, cur_dx, beta, stream
+            ws, lay, l, cfg, ws.dx1, beta, stream
         );
         
-        // 3. QKV Projection Backward GEMMs:
-        // 3a. dW_qkv += (d_layer_qkv)^T @ layer_x_norm1 (3 * C, C)
+        // 4. QKV Projection Backward GEMMs:
+        // 4a. dW_qkv += (d_layer_qkv)^T @ layer_x_norm1 (3 * C, C)
         cublasHandle_t handle = get_cublas_handle();
         cublasSetStream(handle, stream);
         float alpha = 1.0f, beta_zero = 0.0f;
@@ -346,7 +414,7 @@ void run_full_model_backward(
             CUBLAS_GEMM_DEFAULT
         );
         
-        // 3b. dx_norm1 = d_layer_qkv @ W_qkv (M, C)
+        // 4b. dx_norm1 = d_layer_qkv @ W_qkv (M, C)
         cublasGemmEx(
             handle,
             CUBLAS_OP_N, CUBLAS_OP_N,
@@ -360,16 +428,16 @@ void run_full_model_backward(
             CUBLAS_GEMM_DEFAULT
         );
         
-        // 4. RMSNorm 1 Backward:
+        // 5. RMSNorm 1 Backward:
         // Propagate dx_norm1 through RMSNorm 1 -> dx_norm1_in and accumulate lay.d_norm1_weight
         launch_fused_rmsnorm_bwd(
             ws.dx_norm1, ws.stashed_x[l], lay.norm1_weight,
             ws.layer_rsqrt1, ws.dx_norm1_in, lay.d_norm1_weight, M, C, stream
         );
         
-        // 5. Residual 1 Addition:
-        // next_dx = cur_dx + dx_norm1_in
-        launch_fused_add_residual(cur_dx, ws.dx_norm1_in, next_dx, M * C, stream);
+        // 6. Residual 1 Addition:
+        // next_dx = ws.dx1 + dx_norm1_in
+        launch_fused_add_residual(ws.dx1, ws.dx_norm1_in, next_dx, M * C, stream);
         
         // Zero-overhead ping-pong gradient pointer swap (eliminates cudaMemcpyAsync)
         std::swap(cur_dx, next_dx);
@@ -517,7 +585,7 @@ void run_interleaved_forward(
             
             // Step 2f: MoE Gating & Dispatch
             launch_moe_top2_gating(ws.layer_router_logits, ws.layer_topk_gates, ws.layer_topk_idx, ws.l_bal_total, M, cfg.E, 0.1f, true, stream);
-            launch_moe_compute_maps(ws.layer_topk_idx, ws.layer_scatter_map, ws.layer_gather_map, ws.layer_gate_idx_map, M, cfg.E, stream);
+            launch_moe_compute_maps(ws.layer_topk_idx, ws.layer_scatter_map, ws.layer_gather_map, ws.layer_gate_idx_map, ws.layer_expert_offsets, M, cfg.E, stream);
             
             // Step 2g: Expert Grouped GEMMs (W1 and W2)
             if (cfg.use_fused_rmsnorm_quant && cfg.use_fp8_moe) {
@@ -533,9 +601,9 @@ void run_interleaved_forward(
                 cublaslt_gemm_moe_w2_fp8(ws.layer_act_fp8, lay.w2_weights_fp8[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, 1.0f / (16.0f * 64.0f), stream);
             } else {
                 launch_moe_dispatch_gather(ws.layer_x_norm2, ws.layer_gather_map, ws.layer_dispatched_x, M * cfg.top_k, C, stream);
-                cublaslt_gemm_moe_w1_fwd(ws.layer_dispatched_x, lay.w1_weights[0], ws.layer_h1, M * cfg.top_k, C, cfg.hidden_dim, stream);
+                launch_moe_grouped_gemm_fwd_w1(ws.layer_dispatched_x, lay.w1_weights, ws.layer_expert_offsets, ws.layer_h1, M * cfg.top_k, C, cfg.hidden_dim, cfg.E, stream);
                 launch_fused_gelu_fwd(ws.layer_h1, ws.layer_act, M * cfg.top_k * cfg.hidden_dim, stream);
-                cublaslt_gemm_moe_w2_fwd(ws.layer_act, lay.w2_weights[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, stream);
+                launch_moe_grouped_gemm_fwd_w2(ws.layer_act, lay.w2_weights, ws.layer_expert_offsets, ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, cfg.E, stream);
             }
             
             // Step 2h+2i: Fused MoE Scatter Combine + Residual 2 Addition (Direct next-layer stashing!)
@@ -650,15 +718,107 @@ void run_interleaved_backward(
             cublaslt_gemm_qkv_fwd(ws.layer_x_norm1, lay.qkv_weight, ws.layer_qkv, M, C, stream);
             run_native_associative_attention_forward(ws, lay, l, cfg, stream);
             
-            // 2. Analytical Associative Attention Backward:
+            launch_fused_add_rmsnorm_fwd(
+                ws.stashed_x_ms[ms][l], ws.layer_attn_out, lay.norm2_weight,
+                ws.layer_x1, ws.layer_x_norm2, ws.layer_rsqrt2,
+                M, C, 1e-6f, stream
+            );
+            cublaslt_gemm_router_fwd(ws.layer_x_norm2, lay.router_weight, ws.layer_router_logits, M, C, cfg.E, stream);
+            launch_moe_top2_gating(
+                ws.layer_router_logits, ws.layer_topk_gates, ws.layer_topk_idx, ws.l_bal_total,
+                M, cfg.E, 0.1f, true, stream
+            );
+            launch_moe_compute_maps(
+                ws.layer_topk_idx, ws.layer_scatter_map, ws.layer_gather_map, ws.layer_gate_idx_map, ws.layer_expert_offsets,
+                M, cfg.E, stream
+            );
+            launch_moe_dispatch_gather(
+                ws.layer_x_norm2, ws.layer_gather_map, ws.layer_dispatched_x,
+                M * cfg.top_k, C, stream
+            );
+            launch_moe_grouped_gemm_fwd_w1(
+                ws.layer_dispatched_x, lay.w1_weights, ws.layer_expert_offsets, ws.layer_h1,
+                M * cfg.top_k, C, cfg.hidden_dim, cfg.E, stream
+            );
+            launch_fused_gelu_fwd(ws.layer_h1, ws.layer_act, M * cfg.top_k * cfg.hidden_dim, stream);
+            launch_moe_grouped_gemm_fwd_w2(
+                ws.layer_act, lay.w2_weights, ws.layer_expert_offsets, ws.layer_dispatched_y,
+                M * cfg.top_k, cfg.hidden_dim, C, cfg.E, stream
+            );
+            
+            // 2a. MoE Scatter Backward:
+            // cur_dx[ms] (dL/dx2) -> ws.d_dispatched_y, ws.d_topk_gates
+            launch_moe_scatter_backward(
+                cur_dx[ms], ws.layer_dispatched_y, ws.layer_topk_gates,
+                ws.layer_gather_map, ws.layer_gate_idx_map, ws.layer_scatter_map,
+                ws.d_dispatched_y, ws.d_topk_gates,
+                M, M * cfg.top_k, C, stream
+            );
+            
+            // 2b. MoE Grouped W2 Backward:
+            // ws.d_dispatched_y, ws.layer_act -> lay.d_w2_weights (with beta_layer), ws.d_act
+            launch_moe_grouped_gemm_w2_bwd(
+                ws.d_dispatched_y, ws.layer_act, lay.w2_weights,
+                ws.layer_expert_offsets, lay.d_w2_weights, ws.d_act,
+                M * cfg.top_k, cfg.hidden_dim, C, cfg.E, beta_layer, stream
+            );
+            
+            // 2c. Fused GELU Backward:
+            // ws.d_act, ws.layer_h1 -> ws.d_h1
+            launch_fused_gelu_bwd(ws.d_act, ws.layer_h1, ws.d_h1, M * cfg.top_k * cfg.hidden_dim, stream);
+            
+            // 2d. MoE Grouped W1 Backward:
+            // ws.d_h1, ws.layer_dispatched_x -> lay.d_w1_weights (with beta_layer), ws.d_dispatched_x
+            launch_moe_grouped_gemm_w1_bwd(
+                ws.d_h1, ws.layer_dispatched_x, lay.w1_weights,
+                ws.layer_expert_offsets, lay.d_w1_weights, ws.d_dispatched_x,
+                M * cfg.top_k, C, cfg.hidden_dim, cfg.E, beta_layer, stream
+            );
+            
+            // 2e. MoE Gather Backward:
+            // ws.d_dispatched_x -> ws.dx_norm2_expert
+            launch_moe_gather_backward(
+                ws.d_dispatched_x, ws.layer_scatter_map, ws.dx_norm2_expert,
+                M, cfg.top_k, C, stream
+            );
+            
+            // 2f. MoE Router Backward:
+            // ws.d_topk_gates, ws.layer_router_logits, ws.layer_topk_idx -> ws.d_router_logits
+            launch_moe_router_backward(
+                ws.d_topk_gates, ws.layer_router_logits, ws.layer_topk_idx,
+                ws.d_router_logits, M, cfg.E, stream
+            );
+            
+            // 2g. MoE Router GEMMs Backward & Norm2 Input Combination:
+            // ws.d_router_logits, ws.layer_x_norm2 -> lay.d_router_weight (with beta_layer)
+            // ws.d_router_logits @ router_weight + ws.dx_norm2_expert -> ws.dx_norm2
+            launch_moe_router_gemms_bwd(
+                ws.d_router_logits, ws.layer_x_norm2, lay.router_weight,
+                ws.dx_norm2_expert, lay.d_router_weight, ws.dx_norm2,
+                M, C, cfg.E, beta_layer, stream
+            );
+            
+            // 2h. RMSNorm 2 Backward:
+            // ws.dx_norm2 -> ws.dx_norm2_in, lay.d_norm2_weight
+            launch_fused_rmsnorm_bwd(
+                ws.dx_norm2, ws.layer_x1, lay.norm2_weight,
+                ws.layer_rsqrt2, ws.dx_norm2_in, lay.d_norm2_weight, M, C, stream,
+                nullptr, 1.0f, beta_layer
+            );
+            
+            // 2i. Residual 2 Addition:
+            // ws.dx1 = cur_dx[ms] + ws.dx_norm2_in
+            launch_fused_add_residual(cur_dx[ms], ws.dx_norm2_in, ws.dx1, M * C, stream);
+            
+            // 3. Analytical Associative Attention Backward:
             // Computes dW_out (accumulating into lay.d_out_proj_weight with beta_layer)
             // and d_layer_qkv (M, 3 * C) with distinct dQ, dK, dV
             run_native_associative_attention_backward(
-                ws, lay, l, cfg, cur_dx[ms], beta_layer, stream
+                ws, lay, l, cfg, ws.dx1, beta_layer, stream
             );
             
-            // 3. QKV Projection Backward GEMMs:
-            // 3a. dW_qkv += (d_layer_qkv)^T @ layer_x_norm1 (3 * C, C)
+            // 4. QKV Projection Backward GEMMs:
+            // 4a. dW_qkv += (d_layer_qkv)^T @ layer_x_norm1 (3 * C, C)
             cublasHandle_t handle = get_cublas_handle();
             cublasSetStream(handle, stream);
             float alpha = 1.0f, beta_zero = 0.0f;
@@ -675,7 +835,7 @@ void run_interleaved_backward(
                 CUBLAS_GEMM_DEFAULT
             );
             
-            // 3b. dx_norm1 = d_layer_qkv @ W_qkv (M, C)
+            // 4b. dx_norm1 = d_layer_qkv @ W_qkv (M, C)
             cublasGemmEx(
                 handle,
                 CUBLAS_OP_N, CUBLAS_OP_N,
@@ -689,16 +849,17 @@ void run_interleaved_backward(
                 CUBLAS_GEMM_DEFAULT
             );
             
-            // 4. RMSNorm 1 Backward:
+            // 5. RMSNorm 1 Backward:
             // Propagate dx_norm1 through RMSNorm 1 -> dx_norm1_in and accumulate lay.d_norm1_weight
             launch_fused_rmsnorm_bwd(
                 ws.dx_norm1, ws.stashed_x_ms[ms][l], lay.norm1_weight,
-                ws.layer_rsqrt1, ws.dx_norm1_in, lay.d_norm1_weight, M, C, stream
+                ws.layer_rsqrt1, ws.dx_norm1_in, lay.d_norm1_weight, M, C, stream,
+                nullptr, 1.0f, beta_layer
             );
             
-            // 5. Residual 1 Addition:
-            // next_dx[ms] = cur_dx[ms] + dx_norm1_in
-            launch_fused_add_residual(cur_dx[ms], ws.dx_norm1_in, next_dx[ms], M * C, stream);
+            // 6. Residual 1 Addition:
+            // next_dx[ms] = ws.dx1 + dx_norm1_in
+            launch_fused_add_residual(ws.dx1, ws.dx_norm1_in, next_dx[ms], M * C, stream);
             
             // Zero-overhead ping-pong gradient pointer swap (eliminates cudaMemcpyAsync)
             std::swap(cur_dx[ms], next_dx[ms]);
