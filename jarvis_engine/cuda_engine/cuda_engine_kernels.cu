@@ -1,6 +1,7 @@
 #include "cuda_engine.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <math.h>
 #include <stdio.h>
 
@@ -158,7 +159,9 @@ __global__ void fused_add_rmsnorm_fwd_kernel(
     __nv_bfloat16* __restrict__ out_add,
     __nv_bfloat16* __restrict__ out_norm,
     float* __restrict__ rsqrt_out,
-    int M, int C, float eps
+    int M, int C, float eps,
+    __nv_fp8_e4m3* __restrict__ out_norm_fp8 = nullptr,
+    float fp8_scale = 1.0f
 ) {
     int row = blockIdx.x;
     if (row >= M) return;
@@ -169,7 +172,8 @@ __global__ void fused_add_rmsnorm_fwd_kernel(
     const __nv_bfloat16* row_x = x + row * C;
     const __nv_bfloat16* row_res = res ? (res + row * C) : nullptr;
     __nv_bfloat16* row_add = out_add ? (out_add + row * C) : nullptr;
-    __nv_bfloat16* row_norm = out_norm + row * C;
+    __nv_bfloat16* row_norm = out_norm ? (out_norm + row * C) : nullptr;
+    __nv_fp8_e4m3* row_norm_fp8 = out_norm_fp8 ? (out_norm_fp8 + row * C) : nullptr;
     
     // Phase 1: Sum of squares + Register Caching (EXP-28-002 / BUG-009)
     __nv_bfloat16 cached_val[8];
@@ -227,7 +231,13 @@ __global__ void fused_add_rmsnorm_fwd_kernel(
         float val = (item_idx < 8) ? __bfloat162float(cached_val[item_idx++])
                                    : (row_add ? __bfloat162float(row_add[col]) : __bfloat162float(row_x[col]));
         float w = __bfloat162float(weight[col]);
-        row_norm[col] = __float2bfloat16(val * rsqrt_val * w);
+        float norm_val = val * rsqrt_val * w;
+        if (row_norm) {
+            row_norm[col] = __float2bfloat16(norm_val);
+        }
+        if (row_norm_fp8) {
+            row_norm_fp8[col] = __nv_fp8_e4m3(norm_val * fp8_scale);
+        }
     }
 }
 
@@ -239,11 +249,13 @@ void launch_fused_add_rmsnorm_fwd(
     __nv_bfloat16* out_norm,
     float* rsqrt,
     int M, int C, float eps,
-    cudaStream_t stream
+    cudaStream_t stream,
+    __nv_fp8_e4m3* out_norm_fp8,
+    float fp8_scale
 ) {
     const int BLOCK_SIZE = 256;
     fused_add_rmsnorm_fwd_kernel<BLOCK_SIZE><<<M, BLOCK_SIZE, 0, stream>>>(
-        x, res, weight, out_add, out_norm, rsqrt, M, C, eps
+        x, res, weight, out_add, out_norm, rsqrt, M, C, eps, out_norm_fp8, fp8_scale
     );
 }
 
@@ -253,9 +265,11 @@ void launch_fused_rmsnorm_fwd(
     __nv_bfloat16* out_norm,
     float* rsqrt,
     int M, int C, float eps,
-    cudaStream_t stream
+    cudaStream_t stream,
+    __nv_fp8_e4m3* out_norm_fp8,
+    float fp8_scale
 ) {
-    launch_fused_add_rmsnorm_fwd(x, nullptr, weight, nullptr, out_norm, rsqrt, M, C, eps, stream);
+    launch_fused_add_rmsnorm_fwd(x, nullptr, weight, nullptr, out_norm, rsqrt, M, C, eps, stream, out_norm_fp8, fp8_scale);
 }
 
 template<int BLOCK_SIZE>

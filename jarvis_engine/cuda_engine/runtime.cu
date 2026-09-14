@@ -97,6 +97,7 @@ FullModelWorkspace allocate_full_workspace(const FullJarvisConfig& cfg) {
     alloc_bf16(ws.layer_attn_out, M * C);
     alloc_bf16(ws.layer_x1, M * C);
     alloc_bf16(ws.layer_x_norm2, M * C);
+    alloc_fp8(ws.layer_x_norm2_fp8, M * C);
     alloc_f32(ws.layer_rsqrt2, M);
     alloc_bf16(ws.layer_router_logits, M * E);
     alloc_f32(ws.layer_topk_gates, M * top_k);
@@ -189,6 +190,7 @@ void free_full_workspace(FullModelWorkspace& ws) {
     free_p((void*&)ws.layer_attn_out);
     free_p((void*&)ws.layer_x1);
     free_p((void*&)ws.layer_x_norm2);
+    free_p((void*&)ws.layer_x_norm2_fp8);
     free_p((void*&)ws.layer_rsqrt2);
     free_p((void*&)ws.layer_router_logits);
     free_p((void*&)ws.layer_topk_gates);

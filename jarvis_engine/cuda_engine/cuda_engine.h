@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cstdint>
 #include <torch/extension.h>
 
@@ -82,7 +83,9 @@ void launch_fused_add_rmsnorm_fwd(
     __nv_bfloat16* out_norm,
     float* rsqrt,
     int M, int C, float eps,
-    cudaStream_t stream
+    cudaStream_t stream,
+    __nv_fp8_e4m3* out_norm_fp8 = nullptr,
+    float fp8_scale = 1.0f
 );
 
 void launch_fused_rmsnorm_fwd(
@@ -91,7 +94,9 @@ void launch_fused_rmsnorm_fwd(
     __nv_bfloat16* out_norm,
     float* rsqrt,
     int M, int C, float eps,
-    cudaStream_t stream
+    cudaStream_t stream,
+    __nv_fp8_e4m3* out_norm_fp8 = nullptr,
+    float fp8_scale = 1.0f
 );
 
 void launch_fused_rmsnorm_bwd(

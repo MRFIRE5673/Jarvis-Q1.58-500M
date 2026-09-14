@@ -437,5 +437,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_use_bf16_moments", []() { return g_cfg.use_bf16_moments; }, "Phase 29: Get BF16 moments toggle state");
     m.def("set_fp8_qkv", [](bool enabled) { g_cfg.use_fp8_qkv = enabled; }, "Phase 30: Toggle native FP8 QKV forward execution");
     m.def("get_fp8_qkv", []() { return g_cfg.use_fp8_qkv; }, "Phase 30: Query native FP8 QKV forward status");
+    m.def("set_fused_rmsnorm_quant", [](bool enabled) { g_cfg.use_fused_rmsnorm_quant = enabled; }, "Phase 31: Toggle native fused RMSNorm + FP8 quant");
+    m.def("get_fused_rmsnorm_quant", []() { return g_cfg.use_fused_rmsnorm_quant; }, "Phase 31: Query native fused RMSNorm + FP8 quant status");
 }
 

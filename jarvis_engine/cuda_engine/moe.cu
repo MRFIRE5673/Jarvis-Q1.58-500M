@@ -260,6 +260,39 @@ void launch_moe_dispatch_gather(
     );
 }
 
+__global__ void moe_dispatch_gather_fp8_vec16_kernel(
+    const __nv_fp8_e4m3* __restrict__ x_fp8,
+    const int32_t* __restrict__ gather_map,
+    __nv_fp8_e4m3* __restrict__ dispatched_x_fp8,
+    int total_dispatched, int C
+) {
+    int m = blockIdx.x;
+    if (m >= total_dispatched) return;
+    
+    int src_token = gather_map[m];
+    const int4* src = reinterpret_cast<const int4*>(x_fp8 + (size_t)src_token * C);
+    int4* dst = reinterpret_cast<int4*>(dispatched_x_fp8 + (size_t)m * C);
+    
+    int tid = threadIdx.x;
+    int num_vectors = C / 16; // 1024 / 16 = 64 vectors (128-bit)
+    for (int i = tid; i < num_vectors; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+void launch_moe_dispatch_gather_fp8(
+    const __nv_fp8_e4m3* x_fp8,
+    const int32_t* gather_map,
+    __nv_fp8_e4m3* dispatched_x_fp8,
+    int total_dispatched, int C,
+    cudaStream_t stream
+) {
+    const int BLOCK = 64;
+    moe_dispatch_gather_fp8_vec16_kernel<<<total_dispatched, BLOCK, 0, stream>>>(
+        x_fp8, gather_map, dispatched_x_fp8, total_dispatched, C
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 4. MoE Scatter Combine: dispatched_y + gates -> moe_out
 // ---------------------------------------------------------------------------

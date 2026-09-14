@@ -9,13 +9,15 @@
 // External CUDA kernel declarations
 void launch_fused_rmsnorm_fwd(
     const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* out_norm,
-    float* rsqrt, int M, int C, float eps, cudaStream_t stream
+    float* rsqrt, int M, int C, float eps, cudaStream_t stream,
+    __nv_fp8_e4m3* out_norm_fp8 = nullptr, float fp8_scale = 1.0f
 );
 
 void launch_fused_add_rmsnorm_fwd(
     const __nv_bfloat16* x, const __nv_bfloat16* res, const __nv_bfloat16* weight,
     __nv_bfloat16* out_add, __nv_bfloat16* out_norm, float* rsqrt,
-    int M, int C, float eps, cudaStream_t stream
+    int M, int C, float eps, cudaStream_t stream,
+    __nv_fp8_e4m3* out_norm_fp8 = nullptr, float fp8_scale = 1.0f
 );
 
 void launch_fused_rmsnorm_bwd(
@@ -55,6 +57,11 @@ void launch_moe_compute_maps(
 
 void launch_moe_dispatch_gather(
     const __nv_bfloat16* x, const int32_t* gather_map, __nv_bfloat16* dispatched_x,
+    int total_dispatched, int C, cudaStream_t stream
+);
+
+void launch_moe_dispatch_gather_fp8(
+    const __nv_fp8_e4m3* x_fp8, const int32_t* gather_map, __nv_fp8_e4m3* dispatched_x_fp8,
     int total_dispatched, int C, cudaStream_t stream
 );
 
@@ -106,16 +113,23 @@ void run_full_model_forward(
         // Stash layer input for exact analytical backward recomputation (100.66 MB total across 24 layers)
         cudaMemcpyAsync(ws.stashed_x[l], cur_x, M * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
         
-        // Step 2a: Fused RMSNorm 1: cur_x -> ws.layer_x_norm1
-        launch_fused_rmsnorm_fwd(
-            cur_x, lay.norm1_weight, ws.layer_x_norm1, ws.layer_rsqrt1, M, C, eps, stream
-        );
-        
-        // Step 2b: Fused QKV GEMM: (M, C) @ (3C, C).T -> (M, 3C)
-        if (cfg.use_fp8_qkv) {
+        // Step 2a: Fused RMSNorm 1: cur_x -> ws.layer_x_norm1 (or direct FP8)
+        if (cfg.use_fused_rmsnorm_quant && cfg.use_fp8_qkv) {
+            launch_fused_rmsnorm_fwd(
+                cur_x, lay.norm1_weight, nullptr, ws.layer_rsqrt1, M, C, eps, stream,
+                ws.layer_x_norm1_fp8, 16.0f
+            );
+            cublaslt_gemm_qkv_fwd_fp8(ws.layer_x_norm1_fp8, lay.qkv_weight_fp8, ws.layer_qkv, M, C, 3 * C, 1.0f / (16.0f * 64.0f), stream);
+        } else if (cfg.use_fp8_qkv) {
+            launch_fused_rmsnorm_fwd(
+                cur_x, lay.norm1_weight, ws.layer_x_norm1, ws.layer_rsqrt1, M, C, eps, stream
+            );
             launch_quantize_bf16_to_fp8(ws.layer_x_norm1, ws.layer_x_norm1_fp8, 16.0f, M * C, stream);
             cublaslt_gemm_qkv_fwd_fp8(ws.layer_x_norm1_fp8, lay.qkv_weight_fp8, ws.layer_qkv, M, C, 3 * C, 1.0f / (16.0f * 64.0f), stream);
         } else {
+            launch_fused_rmsnorm_fwd(
+                cur_x, lay.norm1_weight, ws.layer_x_norm1, ws.layer_rsqrt1, M, C, eps, stream
+            );
             cublaslt_gemm_qkv_fwd(ws.layer_x_norm1, lay.qkv_weight, ws.layer_qkv, M, C, stream);
         }
         
@@ -125,11 +139,20 @@ void run_full_model_forward(
         
         // Step 2d: Fused Residual 1 + RMSNorm 2 (Phase 16 Single-Pass Breakthrough)
         // Computes x1 = cur_x + attn_out AND x_norm2 = RMSNorm(x1) in ONE memory pass!
-        launch_fused_add_rmsnorm_fwd(
-            cur_x, ws.layer_attn_out, lay.norm2_weight,
-            ws.layer_x1, ws.layer_x_norm2, ws.layer_rsqrt2,
-            M, C, eps, stream
-        );
+        if (cfg.use_fused_rmsnorm_quant && cfg.use_fp8_moe) {
+            launch_fused_add_rmsnorm_fwd(
+                cur_x, ws.layer_attn_out, lay.norm2_weight,
+                ws.layer_x1, ws.layer_x_norm2, ws.layer_rsqrt2,
+                M, C, eps, stream,
+                ws.layer_x_norm2_fp8, 16.0f
+            );
+        } else {
+            launch_fused_add_rmsnorm_fwd(
+                cur_x, ws.layer_attn_out, lay.norm2_weight,
+                ws.layer_x1, ws.layer_x_norm2, ws.layer_rsqrt2,
+                M, C, eps, stream
+            );
+        }
         
         // Step 2e: MoE Router Linear Projection: (M, C) @ (E, C).T -> (M, E)
         cublaslt_gemm_router_fwd(ws.layer_x_norm2, lay.router_weight, ws.layer_router_logits, M, C, cfg.E, stream);
@@ -143,18 +166,30 @@ void run_full_model_forward(
             ws.layer_topk_idx, ws.layer_scatter_map, ws.layer_gather_map, ws.layer_gate_idx_map,
             M, cfg.E, stream
         );
-        launch_moe_dispatch_gather(
-            ws.layer_x_norm2, ws.layer_gather_map, ws.layer_dispatched_x,
-            M * cfg.top_k, C, stream
-        );
         
         // Step 2g: Expert Computation (Grouped MoE W1 + Fused GELU + W2)
-        if (cfg.use_fp8_moe) {
+        if (cfg.use_fused_rmsnorm_quant && cfg.use_fp8_moe) {
+            launch_moe_dispatch_gather_fp8(
+                ws.layer_x_norm2_fp8, ws.layer_gather_map, ws.layer_dispatched_x_fp8,
+                M * cfg.top_k, C, stream
+            );
+            cublaslt_gemm_moe_w1_fp8(ws.layer_dispatched_x_fp8, lay.w1_weights_fp8[0], ws.layer_h1, M * cfg.top_k, C, cfg.hidden_dim, 1.0f / (16.0f * 64.0f), stream);
+            launch_fused_gelu_bf16_to_fp8(ws.layer_h1, ws.layer_act_fp8, 16.0f, M * cfg.top_k * cfg.hidden_dim, stream);
+            cublaslt_gemm_moe_w2_fp8(ws.layer_act_fp8, lay.w2_weights_fp8[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, 1.0f / (16.0f * 64.0f), stream);
+        } else if (cfg.use_fp8_moe) {
+            launch_moe_dispatch_gather(
+                ws.layer_x_norm2, ws.layer_gather_map, ws.layer_dispatched_x,
+                M * cfg.top_k, C, stream
+            );
             launch_quantize_bf16_to_fp8(ws.layer_dispatched_x, ws.layer_dispatched_x_fp8, 16.0f, M * cfg.top_k * C, stream);
             cublaslt_gemm_moe_w1_fp8(ws.layer_dispatched_x_fp8, lay.w1_weights_fp8[0], ws.layer_h1, M * cfg.top_k, C, cfg.hidden_dim, 1.0f / (16.0f * 64.0f), stream);
             launch_fused_gelu_bf16_to_fp8(ws.layer_h1, ws.layer_act_fp8, 16.0f, M * cfg.top_k * cfg.hidden_dim, stream);
             cublaslt_gemm_moe_w2_fp8(ws.layer_act_fp8, lay.w2_weights_fp8[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, 1.0f / (16.0f * 64.0f), stream);
         } else {
+            launch_moe_dispatch_gather(
+                ws.layer_x_norm2, ws.layer_gather_map, ws.layer_dispatched_x,
+                M * cfg.top_k, C, stream
+            );
             cublaslt_gemm_moe_w1_fwd(ws.layer_dispatched_x, lay.w1_weights[0], ws.layer_h1, M * cfg.top_k, C, cfg.hidden_dim, stream);
             launch_fused_gelu_fwd(ws.layer_h1, ws.layer_act, M * cfg.top_k * cfg.hidden_dim, stream);
             cublaslt_gemm_moe_w2_fwd(ws.layer_act, lay.w2_weights[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, stream);
@@ -171,15 +206,22 @@ void run_full_model_forward(
     }
     
     // 3. Final RMSNorm: cur_x -> ws.final_norm_out
-    launch_fused_rmsnorm_fwd(
-        cur_x, params.final_norm_weight, ws.final_norm_out, ws.final_rsqrt, M, C, eps, stream
-    );
-    
-    // 4. Padded LM Head GEMM: (M, C) @ (V_pad, C).T -> (M, V_pad)
-    if (cfg.use_fp8_lm_head) {
+    if (cfg.use_fused_rmsnorm_quant && cfg.use_fp8_lm_head) {
+        launch_fused_rmsnorm_fwd(
+            cur_x, params.final_norm_weight, ws.final_norm_out, ws.final_rsqrt, M, C, eps, stream,
+            ws.final_norm_out_fp8, 16.0f
+        );
+        cublaslt_gemm_lm_head_fwd_fp8(ws.final_norm_out_fp8, params.lm_head_weight_fp8, ws.logits, M, C, cfg.vocab_pad, 1.0f / (16.0f * 64.0f), stream);
+    } else if (cfg.use_fp8_lm_head) {
+        launch_fused_rmsnorm_fwd(
+            cur_x, params.final_norm_weight, ws.final_norm_out, ws.final_rsqrt, M, C, eps, stream
+        );
         launch_quantize_bf16_to_fp8(ws.final_norm_out, ws.final_norm_out_fp8, 16.0f, M * C, stream);
         cublaslt_gemm_lm_head_fwd_fp8(ws.final_norm_out_fp8, params.lm_head_weight_fp8, ws.logits, M, C, cfg.vocab_pad, 1.0f / (16.0f * 64.0f), stream);
     } else {
+        launch_fused_rmsnorm_fwd(
+            cur_x, params.final_norm_weight, ws.final_norm_out, ws.final_rsqrt, M, C, eps, stream
+        );
         cublaslt_gemm_lm_head_fwd(ws.final_norm_out, params.lm_head_weight, ws.logits, M, C, cfg.vocab_pad, stream);
     }
     
@@ -365,13 +407,18 @@ void run_interleaved_forward(
             cudaMemcpyAsync(ws.stashed_x_ms[ms][l], cur_x[ms], M * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
             
             // Step 2a: Fused RMSNorm 1
-            launch_fused_rmsnorm_fwd(cur_x[ms], lay.norm1_weight, ws.layer_x_norm1, ws.layer_rsqrt1, M, C, eps, stream);
-            
-            // Step 2b: Fused QKV GEMM
-            if (cfg.use_fp8_qkv) {
+            if (cfg.use_fused_rmsnorm_quant && cfg.use_fp8_qkv) {
+                launch_fused_rmsnorm_fwd(
+                    cur_x[ms], lay.norm1_weight, nullptr, ws.layer_rsqrt1, M, C, eps, stream,
+                    ws.layer_x_norm1_fp8, 16.0f
+                );
+                cublaslt_gemm_qkv_fwd_fp8(ws.layer_x_norm1_fp8, lay.qkv_weight_fp8, ws.layer_qkv, M, C, 3 * C, 1.0f / (16.0f * 64.0f), stream);
+            } else if (cfg.use_fp8_qkv) {
+                launch_fused_rmsnorm_fwd(cur_x[ms], lay.norm1_weight, ws.layer_x_norm1, ws.layer_rsqrt1, M, C, eps, stream);
                 launch_quantize_bf16_to_fp8(ws.layer_x_norm1, ws.layer_x_norm1_fp8, 16.0f, M * C, stream);
                 cublaslt_gemm_qkv_fwd_fp8(ws.layer_x_norm1_fp8, lay.qkv_weight_fp8, ws.layer_qkv, M, C, 3 * C, 1.0f / (16.0f * 64.0f), stream);
             } else {
+                launch_fused_rmsnorm_fwd(cur_x[ms], lay.norm1_weight, ws.layer_x_norm1, ws.layer_rsqrt1, M, C, eps, stream);
                 cublaslt_gemm_qkv_fwd(ws.layer_x_norm1, lay.qkv_weight, ws.layer_qkv, M, C, stream);
             }
             
@@ -379,11 +426,20 @@ void run_interleaved_forward(
             cublaslt_gemm_attn_out_fwd(ws.layer_qkv, lay.out_proj_weight, ws.layer_attn_out, M, C, stream);
             
             // Step 2d: Fused Residual 1 + RMSNorm 2
-            launch_fused_add_rmsnorm_fwd(
-                cur_x[ms], ws.layer_attn_out, lay.norm2_weight,
-                ws.layer_x1, ws.layer_x_norm2, ws.layer_rsqrt2,
-                M, C, eps, stream
-            );
+            if (cfg.use_fused_rmsnorm_quant && cfg.use_fp8_moe) {
+                launch_fused_add_rmsnorm_fwd(
+                    cur_x[ms], ws.layer_attn_out, lay.norm2_weight,
+                    ws.layer_x1, ws.layer_x_norm2, ws.layer_rsqrt2,
+                    M, C, eps, stream,
+                    ws.layer_x_norm2_fp8, 16.0f
+                );
+            } else {
+                launch_fused_add_rmsnorm_fwd(
+                    cur_x[ms], ws.layer_attn_out, lay.norm2_weight,
+                    ws.layer_x1, ws.layer_x_norm2, ws.layer_rsqrt2,
+                    M, C, eps, stream
+                );
+            }
             
             // Step 2e: Router GEMM
             cublaslt_gemm_router_fwd(ws.layer_x_norm2, lay.router_weight, ws.layer_router_logits, M, C, cfg.E, stream);
@@ -391,15 +447,21 @@ void run_interleaved_forward(
             // Step 2f: MoE Gating & Dispatch
             launch_moe_top2_gating(ws.layer_router_logits, ws.layer_topk_gates, ws.layer_topk_idx, ws.l_bal_total, M, cfg.E, 0.1f, true, stream);
             launch_moe_compute_maps(ws.layer_topk_idx, ws.layer_scatter_map, ws.layer_gather_map, ws.layer_gate_idx_map, M, cfg.E, stream);
-            launch_moe_dispatch_gather(ws.layer_x_norm2, ws.layer_gather_map, ws.layer_dispatched_x, M * cfg.top_k, C, stream);
             
             // Step 2g: Expert Grouped GEMMs (W1 and W2)
-            if (cfg.use_fp8_moe) {
+            if (cfg.use_fused_rmsnorm_quant && cfg.use_fp8_moe) {
+                launch_moe_dispatch_gather_fp8(ws.layer_x_norm2_fp8, ws.layer_gather_map, ws.layer_dispatched_x_fp8, M * cfg.top_k, C, stream);
+                cublaslt_gemm_moe_w1_fp8(ws.layer_dispatched_x_fp8, lay.w1_weights_fp8[0], ws.layer_h1, M * cfg.top_k, C, cfg.hidden_dim, 1.0f / (16.0f * 64.0f), stream);
+                launch_fused_gelu_bf16_to_fp8(ws.layer_h1, ws.layer_act_fp8, 16.0f, M * cfg.top_k * cfg.hidden_dim, stream);
+                cublaslt_gemm_moe_w2_fp8(ws.layer_act_fp8, lay.w2_weights_fp8[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, 1.0f / (16.0f * 64.0f), stream);
+            } else if (cfg.use_fp8_moe) {
+                launch_moe_dispatch_gather(ws.layer_x_norm2, ws.layer_gather_map, ws.layer_dispatched_x, M * cfg.top_k, C, stream);
                 launch_quantize_bf16_to_fp8(ws.layer_dispatched_x, ws.layer_dispatched_x_fp8, 16.0f, M * cfg.top_k * C, stream);
                 cublaslt_gemm_moe_w1_fp8(ws.layer_dispatched_x_fp8, lay.w1_weights_fp8[0], ws.layer_h1, M * cfg.top_k, C, cfg.hidden_dim, 1.0f / (16.0f * 64.0f), stream);
                 launch_fused_gelu_bf16_to_fp8(ws.layer_h1, ws.layer_act_fp8, 16.0f, M * cfg.top_k * cfg.hidden_dim, stream);
                 cublaslt_gemm_moe_w2_fp8(ws.layer_act_fp8, lay.w2_weights_fp8[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, 1.0f / (16.0f * 64.0f), stream);
             } else {
+                launch_moe_dispatch_gather(ws.layer_x_norm2, ws.layer_gather_map, ws.layer_dispatched_x, M * cfg.top_k, C, stream);
                 cublaslt_gemm_moe_w1_fwd(ws.layer_dispatched_x, lay.w1_weights[0], ws.layer_h1, M * cfg.top_k, C, cfg.hidden_dim, stream);
                 launch_fused_gelu_fwd(ws.layer_h1, ws.layer_act, M * cfg.top_k * cfg.hidden_dim, stream);
                 cublaslt_gemm_moe_w2_fwd(ws.layer_act, lay.w2_weights[0], ws.layer_dispatched_y, M * cfg.top_k, cfg.hidden_dim, C, stream);
@@ -417,11 +479,18 @@ void run_interleaved_forward(
     
     // 3. Final RMSNorm & LM Head for both microsteps
     for (int ms = 0; ms < 2; ++ms) {
-        launch_fused_rmsnorm_fwd(cur_x[ms], params.final_norm_weight, ws.final_norm_out_ms[ms], ws.final_rsqrt_ms[ms], M, C, eps, stream);
-        if (cfg.use_fp8_lm_head) {
+        if (cfg.use_fused_rmsnorm_quant && cfg.use_fp8_lm_head) {
+            launch_fused_rmsnorm_fwd(
+                cur_x[ms], params.final_norm_weight, ws.final_norm_out_ms[ms], ws.final_rsqrt_ms[ms], M, C, eps, stream,
+                ws.final_norm_out_fp8_ms[ms], 16.0f
+            );
+            cublaslt_gemm_lm_head_fwd_fp8(ws.final_norm_out_fp8_ms[ms], params.lm_head_weight_fp8, ws.logits_ms[ms], M, C, cfg.vocab_pad, 1.0f / (16.0f * 64.0f), stream);
+        } else if (cfg.use_fp8_lm_head) {
+            launch_fused_rmsnorm_fwd(cur_x[ms], params.final_norm_weight, ws.final_norm_out_ms[ms], ws.final_rsqrt_ms[ms], M, C, eps, stream);
             launch_quantize_bf16_to_fp8(ws.final_norm_out_ms[ms], ws.final_norm_out_fp8_ms[ms], 16.0f, M * C, stream);
             cublaslt_gemm_lm_head_fwd_fp8(ws.final_norm_out_fp8_ms[ms], params.lm_head_weight_fp8, ws.logits_ms[ms], M, C, cfg.vocab_pad, 1.0f / (16.0f * 64.0f), stream);
         } else {
+            launch_fused_rmsnorm_fwd(cur_x[ms], params.final_norm_weight, ws.final_norm_out_ms[ms], ws.final_rsqrt_ms[ms], M, C, eps, stream);
             cublaslt_gemm_lm_head_fwd(ws.final_norm_out_ms[ms], params.lm_head_weight, ws.logits_ms[ms], M, C, cfg.vocab_pad, stream);
         }
         

@@ -26,6 +26,7 @@ struct FullJarvisConfig {
     bool use_fp8_lm_head_backward = false; // Phase 28: Native FP8 LM Head backward toggle
     bool use_bf16_moments = false;        // Phase 29: Native BF16 moments optimizer state toggle (14 B/elem)
     bool use_fp8_qkv = false;             // Phase 30: Native FP8 QKV forward toggle
+    bool use_fused_rmsnorm_quant = true;  // Phase 31: Native Fused RMSNorm + FP8 Activation Quantization toggle
     
     int M() const { return B * T; }                     // 2048 tokens per microstep
     int total_tokens_per_step() const { return B * T * accum_steps; } // 4096 tokens
@@ -117,6 +118,7 @@ struct FullModelWorkspace {
     __nv_bfloat16* layer_attn_out;   // (M, C)
     __nv_bfloat16* layer_x1;         // (M, C)
     __nv_bfloat16* layer_x_norm2;    // (M, C)
+    __nv_fp8_e4m3* layer_x_norm2_fp8;// (M, C) Phase 31: FP8 E4M3 for MoE dispatch
     float*         layer_rsqrt2;     // (M)
     __nv_bfloat16* layer_router_logits; // (M, E)
     float*         layer_topk_gates;    // (M, top_k)
