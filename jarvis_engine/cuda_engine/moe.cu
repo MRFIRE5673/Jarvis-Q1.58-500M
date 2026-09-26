@@ -1,7 +1,9 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cublas_v2.h>
 #include <math.h>
+#include "cublaslt_engine.h"
 
 // ---------------------------------------------------------------------------
 // 1. Top-2 Softmax Gating Kernel with Gaussian Exploration Noise
@@ -591,14 +593,44 @@ void launch_moe_grouped_gemm_fwd_w1(
     int total_tokens, int C, int hidden_dim, int E,
     cudaStream_t stream
 ) {
-    MoEWeightPtrs w1;
-    for (int e = 0; e < E; ++e) w1.w[e] = w1_weights[e];
-    
-    dim3 block(16, 16);
-    dim3 grid((hidden_dim + 15) / 16, (total_tokens + 15) / 16, E);
-    moe_grouped_gemm_fwd_w1_kernel<<<grid, block, 0, stream>>>(
-        dispatched_x, w1, expert_offsets, h1, C, hidden_dim, E
-    );
+    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap_status);
+    cublasHandle_t handle = (cap_status == cudaStreamCaptureStatusNone) ? get_cublas_handle() : nullptr;
+    if (handle) {
+        cublasSetStream(handle, stream);
+        int32_t h_offsets[5];
+        cudaMemcpyAsync(h_offsets, expert_offsets, (E + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        float alpha = 1.0f, beta = 0.0f;
+        for (int e = 0; e < E; ++e) {
+            int m_e = h_offsets[e + 1] - h_offsets[e];
+            if (m_e > 0) {
+                int start_m = h_offsets[e];
+                const __nv_bfloat16* x_ptr = dispatched_x + (size_t)start_m * C;
+                __nv_bfloat16* h1_ptr = h1 + (size_t)start_m * hidden_dim;
+                cublasGemmEx(
+                    handle,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    hidden_dim, m_e, C,
+                    &alpha,
+                    w1_weights[e], CUDA_R_16BF, C,
+                    x_ptr, CUDA_R_16BF, C,
+                    &beta,
+                    h1_ptr, CUDA_R_16BF, hidden_dim,
+                    CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT
+                );
+            }
+        }
+    } else {
+        MoEWeightPtrs w1;
+        for (int e = 0; e < E; ++e) w1.w[e] = w1_weights[e];
+        dim3 block(16, 16);
+        dim3 grid((hidden_dim + 15) / 16, (total_tokens + 15) / 16, E);
+        moe_grouped_gemm_fwd_w1_kernel<<<grid, block, 0, stream>>>(
+            dispatched_x, w1, expert_offsets, h1, C, hidden_dim, E
+        );
+    }
 }
 
 __global__ void moe_grouped_gemm_fwd_w2_kernel(
@@ -649,14 +681,44 @@ void launch_moe_grouped_gemm_fwd_w2(
     int total_tokens, int hidden_dim, int C, int E,
     cudaStream_t stream
 ) {
-    MoEWeightPtrs w2;
-    for (int e = 0; e < E; ++e) w2.w[e] = w2_weights[e];
-    
-    dim3 block(16, 16);
-    dim3 grid((C + 15) / 16, (total_tokens + 15) / 16, E);
-    moe_grouped_gemm_fwd_w2_kernel<<<grid, block, 0, stream>>>(
-        act, w2, expert_offsets, dispatched_y, hidden_dim, C, E
-    );
+    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap_status);
+    cublasHandle_t handle = (cap_status == cudaStreamCaptureStatusNone) ? get_cublas_handle() : nullptr;
+    if (handle) {
+        cublasSetStream(handle, stream);
+        int32_t h_offsets[5];
+        cudaMemcpyAsync(h_offsets, expert_offsets, (E + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        float alpha = 1.0f, beta = 0.0f;
+        for (int e = 0; e < E; ++e) {
+            int m_e = h_offsets[e + 1] - h_offsets[e];
+            if (m_e > 0) {
+                int start_m = h_offsets[e];
+                const __nv_bfloat16* act_ptr = act + (size_t)start_m * hidden_dim;
+                __nv_bfloat16* y_ptr = dispatched_y + (size_t)start_m * C;
+                cublasGemmEx(
+                    handle,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    C, m_e, hidden_dim,
+                    &alpha,
+                    w2_weights[e], CUDA_R_16BF, hidden_dim,
+                    act_ptr, CUDA_R_16BF, hidden_dim,
+                    &beta,
+                    y_ptr, CUDA_R_16BF, C,
+                    CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT
+                );
+            }
+        }
+    } else {
+        MoEWeightPtrs w2;
+        for (int e = 0; e < E; ++e) w2.w[e] = w2_weights[e];
+        dim3 block(16, 16);
+        dim3 grid((C + 15) / 16, (total_tokens + 15) / 16, E);
+        moe_grouped_gemm_fwd_w2_kernel<<<grid, block, 0, stream>>>(
+            act, w2, expert_offsets, dispatched_y, hidden_dim, C, E
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -860,26 +922,73 @@ void launch_moe_grouped_gemm_w2_bwd(
     int total_tokens, int hidden_dim, int C, int E, float beta,
     cudaStream_t stream
 ) {
-    MoEWeightPtrs w2;
-    MoEWeightMutPtrs dw2;
-    for (int e = 0; e < E; ++e) {
-        w2.w[e] = w2_weights[e];
-        dw2.w[e] = d_w2_weights[e];
+    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap_status);
+    cublasHandle_t handle = (cap_status == cudaStreamCaptureStatusNone) ? get_cublas_handle() : nullptr;
+    if (handle) {
+        cublasSetStream(handle, stream);
+        int32_t h_offsets[5];
+        cudaMemcpyAsync(h_offsets, expert_offsets, (E + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        float alpha = 1.0f;
+        float beta_zero = 0.0f;
+        for (int e = 0; e < E; ++e) {
+            int m_e = h_offsets[e + 1] - h_offsets[e];
+            if (m_e > 0) {
+                int start_m = h_offsets[e];
+                const __nv_bfloat16* dy_ptr = grad_dispatched_y + (size_t)start_m * C;
+                const __nv_bfloat16* act_ptr = act + (size_t)start_m * hidden_dim;
+                __nv_bfloat16* dact_ptr = grad_act + (size_t)start_m * hidden_dim;
+                
+                // 1. dW2: C x hidden_dim += dy^T @ act
+                cublasGemmEx(
+                    handle,
+                    CUBLAS_OP_N, CUBLAS_OP_T,
+                    hidden_dim, C, m_e,
+                    &alpha,
+                    act_ptr, CUDA_R_16BF, hidden_dim,
+                    dy_ptr, CUDA_R_16BF, C,
+                    &beta,
+                    d_w2_weights[e], CUDA_R_16BF, hidden_dim,
+                    CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT
+                );
+                
+                // 2. dAct: m_e x hidden_dim = dy @ W2
+                cublasGemmEx(
+                    handle,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    hidden_dim, m_e, C,
+                    &alpha,
+                    w2_weights[e], CUDA_R_16BF, hidden_dim,
+                    dy_ptr, CUDA_R_16BF, C,
+                    &beta_zero,
+                    dact_ptr, CUDA_R_16BF, hidden_dim,
+                    CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT
+                );
+            } else if (beta == 0.0f) {
+                cudaMemsetAsync(d_w2_weights[e], 0, (size_t)C * hidden_dim * sizeof(__nv_bfloat16), stream);
+            }
+        }
+    } else {
+        MoEWeightPtrs w2;
+        MoEWeightMutPtrs dw2;
+        for (int e = 0; e < E; ++e) {
+            w2.w[e] = w2_weights[e];
+            dw2.w[e] = d_w2_weights[e];
+        }
+        dim3 block_dw(16, 16);
+        dim3 grid_dw((hidden_dim + 15) / 16, (C + 15) / 16, E);
+        moe_grouped_dw2_kernel<<<grid_dw, block_dw, 0, stream>>>(
+            grad_dispatched_y, act, expert_offsets, dw2, hidden_dim, C, E, beta
+        );
+        dim3 block_act(16, 16);
+        dim3 grid_act((hidden_dim + 15) / 16, (total_tokens + 15) / 16, E);
+        moe_grouped_dact_kernel<<<grid_act, block_act, 0, stream>>>(
+            grad_dispatched_y, w2, expert_offsets, grad_act, hidden_dim, C, E
+        );
     }
-    
-    // 1. dW2
-    dim3 block_dw(16, 16);
-    dim3 grid_dw((hidden_dim + 15) / 16, (C + 15) / 16, E);
-    moe_grouped_dw2_kernel<<<grid_dw, block_dw, 0, stream>>>(
-        grad_dispatched_y, act, expert_offsets, dw2, hidden_dim, C, E, beta
-    );
-    
-    // 2. dAct
-    dim3 block_act(16, 16);
-    dim3 grid_act((hidden_dim + 15) / 16, (total_tokens + 15) / 16, E);
-    moe_grouped_dact_kernel<<<grid_act, block_act, 0, stream>>>(
-        grad_dispatched_y, w2, expert_offsets, grad_act, hidden_dim, C, E
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -972,26 +1081,73 @@ void launch_moe_grouped_gemm_w1_bwd(
     int total_tokens, int C, int hidden_dim, int E, float beta,
     cudaStream_t stream
 ) {
-    MoEWeightPtrs w1;
-    MoEWeightMutPtrs dw1;
-    for (int e = 0; e < E; ++e) {
-        w1.w[e] = w1_weights[e];
-        dw1.w[e] = d_w1_weights[e];
+    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap_status);
+    cublasHandle_t handle = (cap_status == cudaStreamCaptureStatusNone) ? get_cublas_handle() : nullptr;
+    if (handle) {
+        cublasSetStream(handle, stream);
+        int32_t h_offsets[5];
+        cudaMemcpyAsync(h_offsets, expert_offsets, (E + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        float alpha = 1.0f;
+        float beta_zero = 0.0f;
+        for (int e = 0; e < E; ++e) {
+            int m_e = h_offsets[e + 1] - h_offsets[e];
+            if (m_e > 0) {
+                int start_m = h_offsets[e];
+                const __nv_bfloat16* dh1_ptr = grad_h1 + (size_t)start_m * hidden_dim;
+                const __nv_bfloat16* x_ptr = dispatched_x + (size_t)start_m * C;
+                __nv_bfloat16* dx_ptr = grad_dispatched_x + (size_t)start_m * C;
+                
+                // 1. dW1: hidden_dim x C += dh1^T @ x
+                cublasGemmEx(
+                    handle,
+                    CUBLAS_OP_N, CUBLAS_OP_T,
+                    C, hidden_dim, m_e,
+                    &alpha,
+                    x_ptr, CUDA_R_16BF, C,
+                    dh1_ptr, CUDA_R_16BF, hidden_dim,
+                    &beta,
+                    d_w1_weights[e], CUDA_R_16BF, C,
+                    CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT
+                );
+                
+                // 2. dDispatchedX: m_e x C = dh1 @ W1
+                cublasGemmEx(
+                    handle,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    C, m_e, hidden_dim,
+                    &alpha,
+                    w1_weights[e], CUDA_R_16BF, C,
+                    dh1_ptr, CUDA_R_16BF, hidden_dim,
+                    &beta_zero,
+                    dx_ptr, CUDA_R_16BF, C,
+                    CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT
+                );
+            } else if (beta == 0.0f) {
+                cudaMemsetAsync(d_w1_weights[e], 0, (size_t)hidden_dim * C * sizeof(__nv_bfloat16), stream);
+            }
+        }
+    } else {
+        MoEWeightPtrs w1;
+        MoEWeightMutPtrs dw1;
+        for (int e = 0; e < E; ++e) {
+            w1.w[e] = w1_weights[e];
+            dw1.w[e] = d_w1_weights[e];
+        }
+        dim3 block_dw(16, 16);
+        dim3 grid_dw((C + 15) / 16, (hidden_dim + 15) / 16, E);
+        moe_grouped_dw1_kernel<<<grid_dw, block_dw, 0, stream>>>(
+            grad_h1, dispatched_x, expert_offsets, dw1, C, hidden_dim, E, beta
+        );
+        dim3 block_dx(16, 16);
+        dim3 grid_dx((C + 15) / 16, (total_tokens + 15) / 16, E);
+        moe_grouped_ddisp_x_kernel<<<grid_dx, block_dx, 0, stream>>>(
+            grad_h1, w1, expert_offsets, grad_dispatched_x, C, hidden_dim, E
+        );
     }
-    
-    // 1. dW1
-    dim3 block_dw(16, 16);
-    dim3 grid_dw((C + 15) / 16, (hidden_dim + 15) / 16, E);
-    moe_grouped_dw1_kernel<<<grid_dw, block_dw, 0, stream>>>(
-        grad_h1, dispatched_x, expert_offsets, dw1, C, hidden_dim, E, beta
-    );
-    
-    // 2. dDispatchedX
-    dim3 block_dx(16, 16);
-    dim3 grid_dx((C + 15) / 16, (total_tokens + 15) / 16, E);
-    moe_grouped_ddisp_x_kernel<<<grid_dx, block_dx, 0, stream>>>(
-        grad_h1, w1, expert_offsets, grad_dispatched_x, C, hidden_dim, E
-    );
 }
 
 // ---------------------------------------------------------------------------
