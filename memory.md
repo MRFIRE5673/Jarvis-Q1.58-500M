@@ -62,3 +62,4 @@ This document serves as the persistent memory store for all agent and engineerin
 1. **Section 32 Regression Firewall:** Every optimization must be benchmarked against `JARVIS_PHASE24_GOLDEN`. If throughput drops below 51,733 tok/s or parity is broken ($L_\infty \neq 0$), revert immediately.
 2. **Never stack unproven modifications.**
 3. **Always separate Pre-training, SFT (Instruction Tuning), and Inference optimizations.**
+4. **Native CUDA Engine & Scratch Purge:** `jarvis_engine/cuda_engine/` and all scratch CUDA test binaries have been purged and pushed to git, leaving a clean foundation for new training and inference architectures.
